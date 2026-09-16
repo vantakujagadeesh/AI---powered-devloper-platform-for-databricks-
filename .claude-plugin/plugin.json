@@ -1,0 +1,13 @@
+{
+  "name": "databricks-ai-dev-kit",
+  "deprecated": true,
+  "description": "DEPRECATED — the databricks-ai-dev-kit plugin is no longer published. Install skills via install.sh or `databricks aitools install`, which installs the official `databricks` plugin (Claude Code/Codex/Copilot) or raw skill files (Cursor/OpenCode/Antigravity). Not a move away from plugins. See .claude-plugin/DEPRECATED.md.",
+  "author": {
+    "name": "Databricks Solutions"
+  },
+  "repository": "https://github.com/databricks-solutions/ai-dev-kit",
+  "homepage": "https://github.com/databricks-solutions/ai-dev-kit",
+  "license": "DB License (see repo)",
+  "keywords": ["databricks", "spark", "mlflow", "data-engineering", "ai-agents", "mcp"],
+  "skills": "./databricks-skills/"
+}

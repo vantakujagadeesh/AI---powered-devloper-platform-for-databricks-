@@ -1,0 +1,2855 @@
+#!/bin/bash
+#
+# Databricks AI Dev Kit - Unified Installer
+#
+# Installs Databricks skills and configuration for Claude Code, Cursor, OpenAI Codex, GitHub Copilot, Gemini CLI, Antigravity, Windsurf, OpenCode, and Kiro.
+#
+# The (deprecated, optional) MCP server has its own installer:
+#   databricks-mcp-server/mcp_install.sh   (macOS/Linux)
+#   databricks-mcp-server/mcp_install.ps1  (Windows)
+#
+# Usage: bash <(curl -sL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.sh) [OPTIONS]
+#
+# Examples:
+#   # Basic installation (project scoped, prompts for inputs, uses latest release)
+#   bash <(curl -sL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.sh)
+#
+#   # Global installation with force reinstall
+#   bash <(curl -sL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.sh) --global --force
+#
+#   # Specify profile and force reinstall
+#   bash <(curl -sL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.sh) --profile DEFAULT --force
+#
+#   # Install for specific tools only
+#   bash <(curl -sL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.sh) --tools cursor,codex,copilot,gemini
+#
+#   # Install skills for a specific profile
+#   bash <(curl -sL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.sh) --skills-profile data-engineer
+#
+#   # Install multiple profiles
+#   bash <(curl -sL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.sh) --skills-profile data-engineer,ai-ml-engineer
+#
+#   # Install specific skills only
+#   bash <(curl -sL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.sh) --skills databricks-jobs,databricks-dbsql
+#
+#   # List available skills and profiles
+#   bash <(curl -sL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.sh) --list-skills
+#
+# Alternative: Use environment variables
+#   DEVKIT_TOOLS=cursor curl -sL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.sh | bash
+#   DEVKIT_FORCE=true DEVKIT_PROFILE=DEFAULT curl -sL https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/main/install.sh | bash
+#
+
+set -e
+
+# Defaults (can be overridden by environment variables or command-line arguments)
+PROFILE="${DEVKIT_PROFILE:-DEFAULT}"
+SCOPE="${DEVKIT_SCOPE:-project}"
+SCOPE_EXPLICIT=false  # Track if --global was explicitly passed
+FORCE="${DEVKIT_FORCE:-false}"
+IS_UPDATE=false
+UNINSTALL=false
+DRY_RUN=false
+ASSUME_YES=false
+SILENT="${DEVKIT_SILENT:-false}"
+TOOLS="${DEVKIT_TOOLS:-}"
+USER_TOOLS=""
+SKILLS_PROFILE="${DEVKIT_SKILLS_PROFILE:-}"
+USER_SKILLS="${DEVKIT_SKILLS:-}"
+DRY_RUN="${DRY_RUN:-false}"
+# Include experimental agent skills in profile/"all" selections (default: true).
+# Pass --experimental false (or DEVKIT_EXPERIMENTAL=false) to install only stable
+# skills. Explicit --skills requests are always honored as named.
+INSTALL_EXPERIMENTAL="${DEVKIT_EXPERIMENTAL:-true}"
+
+# Raw-fetch ref override for MLflow skills (mlflow/skills is tagless — main is intentional)
+MLFLOW_REF="${MLFLOW_REF:-main}"
+INCLUDE_PRERELEASES="${INCLUDE_PRERELEASES:-0}"
+
+# Convert string booleans from env vars to actual booleans
+[ "$FORCE" = "true" ] || [ "$FORCE" = "1" ] && FORCE=true || FORCE=false
+[ "$SILENT" = "true" ] || [ "$SILENT" = "1" ] && SILENT=true || SILENT=false
+[ "$DRY_RUN" = "true" ] || [ "$DRY_RUN" = "1" ] && DRY_RUN=true || DRY_RUN=false
+# Experimental defaults to true; only "false"/"0" turn it off
+[ "$INSTALL_EXPERIMENTAL" = "false" ] || [ "$INSTALL_EXPERIMENTAL" = "0" ] && INSTALL_EXPERIMENTAL=false || INSTALL_EXPERIMENTAL=true
+
+# Check if scope was explicitly set via env var
+[ -n "${DEVKIT_SCOPE:-}" ] && SCOPE_EXPLICIT=true
+
+OWNER="databricks-solutions"
+REPO="ai-dev-kit"
+
+# Branch/tag override. DEVKIT_BRANCH is canonical; AIDEVKIT_BRANCH is accepted
+# as an alias so the bash and PowerShell installers honor the same env var.
+# BRANCH_EXPLICIT tracks whether the user asked for a specific ref (vs the
+# auto-resolved latest release) — an explicit ref triggers the branch hand-off.
+BRANCH_EXPLICIT=false
+if [ -n "${DEVKIT_BRANCH:-${AIDEVKIT_BRANCH:-}}" ]; then
+  BRANCH="${DEVKIT_BRANCH:-$AIDEVKIT_BRANCH}"
+  BRANCH_EXPLICIT=true
+else
+  BRANCH="$(
+    curl -s "https://api.github.com/repos/${OWNER}/${REPO}/releases/latest" \
+    | grep '"tag_name"' \
+    | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/'
+  )"
+  # Fallback to main if we couldn't fetch the latest release
+  [ -z "$BRANCH" ] && BRANCH="main"
+fi
+
+# Installation mode. This installer sets up skills only. The (deprecated,
+# optional) MCP server has moved to its own installer:
+#   databricks-mcp-server/mcp_install.sh   (macOS/Linux)
+#   databricks-mcp-server/mcp_install.ps1  (Windows)
+INSTALL_SKILLS=true
+
+# Minimum required versions
+MIN_CLI_VERSION="0.278.0"
+# Agent skills are delegated to `databricks aitools`, which ships with CLI v1.0.0+
+MIN_AITOOLS_CLI_VERSION="1.0.0"
+
+# Colors
+G='\033[0;32m' Y='\033[1;33m' R='\033[0;31m' BL='\033[0;34m' B='\033[1m' D='\033[2m' N='\033[0m'
+
+# MLflow skills (fetched from mlflow/skills repo; MLFLOW_REF defaults to main — the repo is tagless)
+MLFLOW_SKILLS="agent-evaluation analyze-mlflow-chat-session analyze-mlflow-trace instrumenting-with-mlflow-tracing mlflow-onboarding querying-mlflow-metrics retrieving-mlflow-traces searching-mlflow-docs"
+MLFLOW_BASE_URL="https://raw.githubusercontent.com/mlflow/skills"
+
+# Agent skills (from databricks/databricks-agent-skills, installed and managed by
+# `databricks aitools`, which ships with the Databricks CLI v1.0.0+).
+# The live inventory is discovered at runtime via `databricks aitools list -o json`
+# (see fetch_agent_b_inventory); these lists are the fallback snapshot (v0.2.10),
+# used only when the CLI is unavailable/offline.
+AGENT_B_STABLE_FALLBACK="databricks-agent-bricks databricks-ai-functions databricks-aibi-dashboards databricks-app-design databricks-apps databricks-apps-python databricks-core databricks-dabs databricks-data-discovery databricks-dbsql databricks-docs databricks-execution-compute databricks-iceberg databricks-jobs databricks-lakebase databricks-lakeflow-connect databricks-metric-views databricks-ml-training databricks-mlflow-evaluation databricks-model-serving databricks-pipelines databricks-python-sdk databricks-serverless-migration databricks-spark-structured-streaming databricks-synthetic-data-gen databricks-unity-catalog databricks-unstructured-pdf-generation databricks-vector-search databricks-zerobus-ingest"
+AGENT_B_EXPERIMENTAL_FALLBACK="databricks-ai-runtime databricks-genie spark-python-data-source"
+# Skills never installed by default (excluded from "all" and profile selections;
+# still installable via an explicit --skills request). Space-separated; empty = none.
+# NOTE: keep this empty unless a skill genuinely shouldn't ship by default — the
+# native "all" install (install_agent_b_all) runs `databricks aitools install`
+# with no --skills filter, so it does NOT honor this list. Excluding a name here
+# only shrinks the displayed count/selection, making it disagree with what the
+# "all" path actually installs. (databricks-execution-compute was removed: it's a
+# first-class stable skill in the databricks-agent-skills manifest.)
+AGENT_B_EXCLUDED=""
+# Populated by fetch_agent_b_inventory (live or fallback)
+AGENT_B_STABLE=""
+AGENT_B_EXPERIMENTAL=""
+AGENT_B_RELEASE=""
+
+# Old skill names → new names (breaking rename when sourcing moved to
+# databricks-agent-skills). Explicit requests for old names are migrated with a warning.
+RENAMED_SKILLS="databricks-bundles:databricks-dabs databricks-spark-declarative-pipelines:databricks-pipelines databricks-config:databricks-core databricks:databricks-core databricks-lakebase-autoscale:databricks-lakebase databricks-lakebase-provisioned:databricks-lakebase databricks-genie:databricks-genie-agents"
+
+# ─── Skill profiles ──────────────────────────────────────────
+# Core skills always installed regardless of profile selection (all from databricks-agent-skills)
+CORE_SKILLS="databricks-core databricks-docs databricks-python-sdk databricks-unity-catalog"
+
+# Profile definitions (non-core skills only — core skills are always added).
+# Names may come from any source; resolve_skills buckets them.
+PROFILE_DATA_ENGINEER="databricks-pipelines databricks-spark-structured-streaming databricks-jobs databricks-dabs databricks-dbsql databricks-iceberg databricks-lakeflow-connect databricks-zerobus-ingest spark-python-data-source databricks-metric-views databricks-synthetic-data-gen"
+PROFILE_ANALYST="databricks-aibi-dashboards databricks-dbsql databricks-genie databricks-metric-views"
+PROFILE_AIML_ENGINEER="databricks-agent-bricks databricks-ai-functions databricks-vector-search databricks-model-serving databricks-genie databricks-unstructured-pdf-generation databricks-mlflow-evaluation databricks-synthetic-data-gen databricks-jobs"
+PROFILE_AIML_MLFLOW="agent-evaluation analyze-mlflow-chat-session analyze-mlflow-trace instrumenting-with-mlflow-tracing mlflow-onboarding querying-mlflow-metrics retrieving-mlflow-traces searching-mlflow-docs"
+PROFILE_APP_DEVELOPER="databricks-apps databricks-apps-python databricks-lakebase databricks-model-serving databricks-dbsql databricks-jobs databricks-dabs"
+
+# Selected skills (populated during profile selection)
+SELECTED_MLFLOW_SKILLS=""
+SELECTED_AGENT_B_SKILLS=""
+# True when the user selected *all* agent skills (the "all" profile). In that case
+# we skip the fragile per-skill enumeration and let `databricks aitools install`
+# define the full set itself (its native default = every stable skill; add
+# --experimental for the rest). A partial selection (a profile subset or --skills)
+# keeps the enumerated --skills path.
+SELECTED_ALL_AGENT_B=false
+
+# Output helpers
+msg()  { [ "$SILENT" = true ] || echo -e "  $*"; }
+ok()   { [ "$SILENT" = true ] || echo -e "  ${G}✓${N} $*"; }
+warn() { [ "$SILENT" = true ] || echo -e "  ${Y}!${N} $*"; }
+die()  { echo -e "  ${R}✗${N} $*" >&2; exit 1; }  # Always show errors
+step() { [ "$SILENT" = true ] || echo -e "\n${B}$*${N}"; }
+
+# Deprecation notice for the removed MCP flags/env. Always printed to stderr
+# (even in silent mode) since the user explicitly passed a now-removed option.
+mcp_moved_notice() {
+    echo -e "  ${Y}!${N} MCP setup has moved out of this installer. Run databricks-mcp-server/mcp_install.sh (or mcp_install.ps1 on Windows) to install and register the Databricks MCP server." >&2
+}
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+    case $1 in
+        -p|--profile)     PROFILE="$2"; shift 2 ;;
+        -g|--global)      SCOPE="global"; SCOPE_EXPLICIT=true; shift ;;
+        -b|--branch)      BRANCH="$2"; BRANCH_EXPLICIT=true; shift 2 ;;
+        --skills-only)    shift ;;  # accepted for backward compat (skills-only is now the only mode)
+        # Removed MCP flags — handled gracefully. --mcp warns and continues with
+        # the normal (skills-only) install; --mcp-path also consumes its value so
+        # arg-parsing doesn't choke on the now-unknown argument.
+        --mcp)            mcp_moved_notice; shift ;;
+        --mcp-path)       mcp_moved_notice; shift; [ $# -gt 0 ] && shift || true ;;
+        # --mcp-only had no non-MCP work to do, so just point the user and exit
+        # cleanly (informative, not a crash).
+        --mcp-only)       mcp_moved_notice; exit 0 ;;
+        --skills-profile) SKILLS_PROFILE="$2"; shift 2 ;;
+        --skills)         USER_SKILLS="$2"; shift 2 ;;
+        --list-skills)    LIST_SKILLS=true; shift ;;
+        --experimental)
+            case "$2" in
+                false|0) INSTALL_EXPERIMENTAL=false; shift 2 ;;
+                true|1)  INSTALL_EXPERIMENTAL=true; shift 2 ;;
+                *)       INSTALL_EXPERIMENTAL=true; shift ;;
+            esac ;;
+        --silent)         SILENT=true; shift ;;
+        --tools)          USER_TOOLS="$2"; shift 2 ;;
+        --dry-run)        DRY_RUN=true; shift ;;
+        -f|--force)       FORCE=true; shift ;;
+        --uninstall)      UNINSTALL=true; shift ;;
+        -y|--yes)         ASSUME_YES=true; shift ;;
+        -h|--help)
+            echo "Databricks AI Dev Kit Installer"
+            echo ""
+            echo "Usage: bash <(curl -sL .../install.sh) [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  -p, --profile NAME    Databricks profile (default: DEFAULT)"
+            echo "  -b, --branch NAME     Install a specific release/branch (runs that version's own installer)"
+            echo "  -g, --global          Install globally for all projects"
+            echo "  --silent              Silent mode (no output except errors)"
+            echo "  --tools LIST          Comma-separated: claude,cursor,copilot,codex,gemini,antigravity,windsurf,opencode,kiro"
+            echo "  --skills-profile LIST Comma-separated profiles: all,data-engineer,analyst,ai-ml-engineer,app-developer"
+            echo "  --skills LIST         Comma-separated skill names to install (overrides profile)"
+            echo "  --list-skills         List available skills and profiles, then exit"
+            echo "  --experimental BOOL   Include experimental agent skills (default: true; 'false' = stable only)"
+            echo "  --dry-run             Print what would be installed (resolved refs, aitools command) and exit"
+            echo "  -f, --force           Force reinstall"
+            echo "  --uninstall           Remove AI Dev Kit: skills, Claude Code plugin, and any leftover MCP config from older installs"
+            echo "  --dry-run             With --uninstall: print what would be removed, change nothing"
+            echo "  -y, --yes             With --uninstall: skip the confirmation prompt"
+            echo "  -h, --help            Show this help"
+            echo ""
+            echo "Environment Variables (alternative to flags):"
+            echo "  DEVKIT_PROFILE        Databricks config profile"
+            echo "  DEVKIT_BRANCH         Git branch/tag to install (alias: AIDEVKIT_BRANCH; default: latest release)"
+            echo "  DEVKIT_SCOPE          'project' or 'global'"
+            echo "  DEVKIT_TOOLS          Comma-separated list of tools"
+            echo "  DEVKIT_FORCE          Set to 'true' to force reinstall"
+            echo "  DEVKIT_SKILLS_PROFILE Comma-separated skill profiles"
+            echo "  DEVKIT_SKILLS         Comma-separated skill names"
+            echo "  DEVKIT_SILENT         Set to 'true' for silent mode"
+            echo "  DEVKIT_EXPERIMENTAL   'true' (default) or 'false' to skip experimental agent skills"
+            echo "  AIDEVKIT_HOME         Installation directory (default: ~/.ai-dev-kit)"
+            echo "  MLFLOW_REF            Ref for MLflow skills fetch (default: main)"
+            echo "  DRY_RUN               Set to '1' to print the install plan and exit"
+            echo ""
+            echo "Notes:"
+            echo "  Most Databricks skills are installed via 'databricks aitools' (Databricks CLI v1.0.0+)"
+            echo "  and are updated/uninstalled with 'databricks aitools update|uninstall', not this script."
+            echo "  The MCP server is deprecated/optional and has its own installer:"
+            echo "  bash databricks-mcp-server/mcp_install.sh (or mcp_install.ps1 on Windows)."
+            echo "  Renamed skills: databricks-bundles -> databricks-dabs,"
+            echo "  databricks-spark-declarative-pipelines -> databricks-pipelines."
+            echo "  Replaced skills: databricks-config -> databricks-core,"
+            echo "  databricks-lakebase-autoscale/provisioned -> databricks-lakebase."
+            echo ""
+            echo "Examples:"
+            echo "  # Using environment variables"
+            echo "  DEVKIT_TOOLS=cursor curl -sL .../install.sh | bash"
+            echo ""
+            exit 0 ;;
+        *) die "Unknown option: $1 (use -h for help)" ;;
+    esac
+done
+
+# Removed MCP env var — warn and continue with the normal (skills-only) install.
+if [ "${DEVKIT_INSTALL_MCP:-}" = "true" ] || [ "${DEVKIT_INSTALL_MCP:-}" = "1" ]; then
+    mcp_moved_notice
+fi
+
+# ─── --list-skills handler ─────────────────────────────────────
+# (function — needs fetch_agent_b_inventory; invoked after function definitions below)
+_count() { echo $#; }
+
+# Number of skills the "all" profile installs (excluded agent skills omitted)
+_count_all_skills() {
+    local n skill
+    n=$(_count $MLFLOW_SKILLS $AGENT_B_STABLE $AGENT_B_EXPERIMENTAL)
+    for skill in $AGENT_B_EXCLUDED; do
+        _in_list "$skill" "$AGENT_B_STABLE $AGENT_B_EXPERIMENTAL" && n=$((n - 1))
+    done
+    echo "$n"
+}
+
+list_skills_and_exit() {
+    fetch_agent_b_inventory
+
+    local all_count de_count an_count ai_count ap_count
+    all_count=$(_count_all_skills)
+    de_count=$(_count $CORE_SKILLS $PROFILE_DATA_ENGINEER)
+    an_count=$(_count $CORE_SKILLS $PROFILE_ANALYST)
+    ai_count=$(_count $CORE_SKILLS $PROFILE_AIML_ENGINEER $PROFILE_AIML_MLFLOW)
+    ap_count=$(_count $CORE_SKILLS $PROFILE_APP_DEVELOPER)
+
+    echo ""
+    echo -e "${B}Available Skill Profiles${N}"
+    echo "────────────────────────────────"
+    echo ""
+    echo -e "  ${B}all${N}              All ${all_count} skills (default)"
+    echo -e "  ${B}data-engineer${N}    Pipelines, Spark, Jobs, Streaming (${de_count} skills)"
+    echo -e "  ${B}analyst${N}          Dashboards, SQL, Genie, Metrics (${an_count} skills)"
+    echo -e "  ${B}ai-ml-engineer${N}   Agents, RAG, Vector Search, MLflow (${ai_count} skills)"
+    echo -e "  ${B}app-developer${N}    Apps, Lakebase, Deployment (${ap_count} skills)"
+    echo ""
+    echo -e "${B}Core Skills${N} (always installed)"
+    echo "────────────────────────────────"
+    for skill in $CORE_SKILLS; do
+        echo -e "  ${G}✓${N} $skill"
+    done
+    echo ""
+    echo -e "${B}Data Engineer${N}"
+    echo "────────────────────────────────"
+    for skill in $PROFILE_DATA_ENGINEER; do
+        echo -e "    $skill"
+    done
+    echo ""
+    echo -e "${B}Business Analyst${N}"
+    echo "────────────────────────────────"
+    for skill in $PROFILE_ANALYST; do
+        echo -e "    $skill"
+    done
+    echo ""
+    echo -e "${B}AI/ML Engineer${N}"
+    echo "────────────────────────────────"
+    for skill in $PROFILE_AIML_ENGINEER; do
+        echo -e "    $skill"
+    done
+    echo -e "  ${D}+ MLflow skills:${N}"
+    for skill in $PROFILE_AIML_MLFLOW; do
+        echo -e "    $skill"
+    done
+    echo ""
+    echo -e "${B}App Developer${N}"
+    echo "────────────────────────────────"
+    for skill in $PROFILE_APP_DEVELOPER; do
+        echo -e "    $skill"
+    done
+    echo ""
+    echo -e "${B}MLflow Skills${N} (from mlflow/skills repo @ ${MLFLOW_REF})"
+    echo "────────────────────────────────"
+    for skill in $MLFLOW_SKILLS; do
+        echo -e "    $skill"
+    done
+    echo ""
+    echo -e "${B}Agent Skills${N} (from databricks/databricks-agent-skills${AGENT_B_RELEASE:+ @ $AGENT_B_RELEASE} — managed by ${B}databricks aitools${N})"
+    echo "────────────────────────────────"
+    for skill in $AGENT_B_STABLE; do
+        echo -e "    $skill"
+    done
+    echo -e "  ${D}experimental:${N}"
+    for skill in $AGENT_B_EXPERIMENTAL; do
+        if echo "$AGENT_B_EXCLUDED" | tr ' ' '\n' | grep -Fxq "$skill"; then
+            echo -e "    ${D}$skill (excluded by default — request explicitly via --skills)${N}"
+        else
+            echo -e "    $skill"
+        fi
+    done
+    echo ""
+    echo -e "${D}Usage: bash install.sh --skills-profile data-engineer,ai-ml-engineer${N}"
+    echo -e "${D}       bash install.sh --skills databricks-jobs,databricks-dbsql${N}"
+    echo ""
+    exit 0
+}
+
+# ─── --uninstall handler ───────────────────────────────────────
+# All skill directory names the installer has EVER shipped (current + historical
+# renames/removals). Uninstall sweeps this union so old installs — e.g. the
+# removed databricks-lakebase-provisioned or the renamed databricks-app-python —
+# are cleaned up, not just whatever the current release ships.
+UNINSTALL_SKILL_NAMES="
+databricks-agent-bricks databricks-ai-functions databricks-aibi-dashboards
+databricks-bundles databricks-asset-bundles databricks-apps-python databricks-app-python
+databricks-app-apx databricks-config databricks-dbsql databricks-docs
+databricks-execution-compute databricks-genie databricks-iceberg databricks-jobs
+databricks-lakebase-autoscale databricks-lakebase-provisioned databricks-metric-views
+databricks-ml-training-serving databricks-model-serving databricks-mlflow-evaluation
+databricks-parsing databricks-python-sdk databricks-spark-declarative-pipelines
+databricks-spark-structured-streaming databricks-synthetic-data-gen databricks-synthetic-data-generation
+databricks-unity-catalog databricks-unstructured-pdf-generation databricks-vector-search
+databricks-zerobus-ingest spark-python-data-source
+databricks databricks-apps databricks-lakebase
+agent-evaluation analyze-mlflow-chat-session analyze-mlflow-trace
+instrumenting-with-mlflow-tracing mlflow-onboarding querying-mlflow-metrics
+retrieving-mlflow-traces searching-mlflow-docs
+"
+
+# The Claude Code plugin (installed via a marketplace, separate from the skills
+# this script drops directly). Its on-disk state lives across several shared
+# files (~/.claude/plugins/installed_plugins.json, enabledPlugins in
+# settings.json, known_marketplaces.json, the cache dir) that are shared with
+# the user's OTHER plugins — so we never hand-edit them. Detection is read-only;
+# removal is delegated to the official `claude` CLI (or shown as a command).
+#
+# The plugin can be installed from ANY marketplace, so we match by plugin name and
+# discover the actual "name@marketplace" key(s) rather than assuming a marketplace.
+PLUGIN_NAME="databricks-ai-dev-kit"
+
+# Read-only: true only if the EXACT top-level server key ($2) contains a
+# 'databricks' entry — the same thing removal targets. This deliberately does NOT
+# match nested occurrences (e.g. ~/.claude.json's projects.<path>.mcpServers.databricks,
+# which is a project-scoped server we never touch) that a plain grep would flag.
+mcp_json_has_databricks() {
+    local path=$1 top=$2 py=""
+    [ -f "$path" ] || return 1
+    command -v python3 >/dev/null 2>&1 && py=python3
+    [ -z "$py" ] && [ -f "$VENV_PYTHON" ] && py="$VENV_PYTHON"
+    # No Python: fall back to a loose grep (best effort; may over-match).
+    [ -z "$py" ] && { grep -qF '"databricks"' "$path" 2>/dev/null; return; }
+    "$py" - "$path" "$top" <<'PYEOF'
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+top = cfg.get(sys.argv[2])
+sys.exit(0 if (isinstance(top, dict) and "databricks" in top) else 1)
+PYEOF
+}
+
+# Remove the 'databricks' MCP server entry from a JSON config, preserving all
+# other servers and settings. $2 is the top-level key ('mcpServers' or 'servers').
+uninstall_remove_json_key() {
+    local path=$1 top=$2
+    [ -f "$path" ] || return 1
+    grep -qF '"databricks"' "$path" 2>/dev/null || return 1
+    if [ "$DRY_RUN" = true ]; then echo "$path"; return 0; fi
+    local py=""
+    command -v python3 >/dev/null 2>&1 && py=python3
+    [ -z "$py" ] && [ -f "$VENV_PYTHON" ] && py="$VENV_PYTHON"
+    if [ -z "$py" ]; then warn "No Python to edit $path — remove the 'databricks' entry manually."; return 1; fi
+    # Python decides whether the exact top-level 'databricks' key is present; it
+    # writes (and the shell backs up) only when a key is actually removed, so a
+    # stray '"databricks"' elsewhere in the file doesn't trigger a no-op rewrite.
+    cp "$path" "${path}.bak"
+    if "$py" - "$path" "$top" <<'PYEOF'
+import json, sys
+path, top = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f: cfg = json.load(f)
+except Exception: sys.exit(2)
+if not (isinstance(cfg.get(top), dict) and 'databricks' in cfg[top]):
+    sys.exit(1)  # nothing to remove
+cfg[top].pop('databricks', None)
+if not cfg[top]: cfg.pop(top, None)
+with open(path, 'w') as f: json.dump(cfg, f, indent=2); f.write('\n')
+sys.exit(0)
+PYEOF
+    then
+        return 0
+    else
+        rm -f "${path}.bak"   # nothing changed — don't leave a spurious backup
+        return 1
+    fi
+}
+
+# Remove the [mcp_servers.databricks] block from a Codex TOML config.
+uninstall_remove_toml_block() {
+    local path=$1
+    [ -f "$path" ] || return 1
+    grep -qF 'mcp_servers.databricks' "$path" 2>/dev/null || return 1
+    if [ "$DRY_RUN" = true ]; then echo "$path"; return 0; fi
+    cp "$path" "${path}.bak"
+    # Delete the [mcp_servers.databricks] table AND its dotted subtables
+    # (e.g. [mcp_servers.databricks.env]) through to the next unrelated
+    # [section] header (or EOF). awk keeps everything outside that block.
+    awk '
+        /^\[mcp_servers\.databricks(\.|\])/ { skip=1; next }
+        /^\[/ { skip=0 }
+        !skip { print }
+    ' "${path}.bak" > "$path"
+    return 0
+}
+
+# Remove the AI Dev Kit SessionStart hook (identified by check_update.sh) from a
+# Claude settings.json, leaving other hooks intact.
+uninstall_remove_claude_hook() {
+    local path=$1
+    [ -f "$path" ] || return 1
+    grep -q 'check_update.sh' "$path" 2>/dev/null || return 1
+    if [ "$DRY_RUN" = true ]; then echo "$path"; return 0; fi
+    local py=""
+    command -v python3 >/dev/null 2>&1 && py=python3
+    [ -z "$py" ] && [ -f "$VENV_PYTHON" ] && py="$VENV_PYTHON"
+    [ -z "$py" ] && { warn "No Python to edit $path — remove the check_update.sh hook manually."; return 1; }
+    cp "$path" "${path}.bak"
+    "$py" - "$path" <<'PYEOF'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f: cfg = json.load(f)
+except Exception: sys.exit(0)
+sh = cfg.get('hooks', {}).get('SessionStart')
+if isinstance(sh, list):
+    for group in sh:
+        group['hooks'] = [h for h in group.get('hooks', []) if 'check_update.sh' not in h.get('command', '')]
+    sh[:] = [g for g in sh if g.get('hooks')]
+    if not sh: cfg['hooks'].pop('SessionStart', None)
+    if not cfg.get('hooks'): cfg.pop('hooks', None)
+with open(path, 'w') as f: json.dump(cfg, f, indent=2); f.write('\n')
+PYEOF
+    return 0
+}
+
+# Read-only detection of the plugin per scope. The scope is recorded by which
+# settings.json enables it: user scope in ~/.claude/settings.json, project scope in
+# the project's .claude/settings.json(.local). (installed_plugins.json is user-level
+# and lists ALL scopes together, so it can't distinguish them.) Prints the enabled
+# "name@marketplace" key(s) — one per line — so any marketplace is matched.
+plugin_keys_in() {
+    grep -hoE "\"${PLUGIN_NAME}@[A-Za-z0-9._-]+\"" "$@" 2>/dev/null | tr -d '"' | sort -u
+}
+plugin_keys_global()  { plugin_keys_in "$HOME/.claude/settings.json"; }
+plugin_keys_project() { plugin_keys_in "$1/.claude/settings.json" "$1/.claude/settings.local.json"; }
+
+# Warn that the plugin also exists in the scope we're NOT uninstalling, and print
+# the command to remove each detected key there too. $1 = newline-separated keys.
+# Leads with a blank line to separate it from whatever preceded it.
+# Count skill folders and 'databricks' MCP entries under the given roots/targets,
+# plus hook/state/plugin, emitting one "  - ..." summary line each. Shared by the
+# project- and global-scope summaries below. Read-only; always returns 0.
+_leftovers_summary() {
+    local hook=$1 state_dir=$2 plugin_keys=$3; shift 3
+    local root name entry path kind n=0
+    # Remaining args: skill roots, then a "--" separator, then "path|kind" MCP targets.
+    local -a roots=() targets=(); local sep=false a
+    for a in "$@"; do
+        [ "$a" = "--" ] && { sep=true; continue; }
+        $sep && targets+=("$a") || roots+=("$a")
+    done
+    for root in "${roots[@]}"; do
+        [ -d "$root" ] || continue
+        for name in $UNINSTALL_SKILL_NAMES; do [ -d "$root/$name" ] && n=$((n + 1)); done
+    done
+    [ "$n" -gt 0 ] && echo "  - ${n} skill folder(s)"
+    n=0
+    for entry in "${targets[@]}"; do
+        path="${entry%%|*}"; kind="${entry#*|}"
+        [ -f "$path" ] || continue
+        case "$kind" in
+            json:*) mcp_json_has_databricks "$path" "${kind#json:}" && n=$((n + 1)) ;;
+            toml)   grep -qF 'mcp_servers.databricks' "$path" 2>/dev/null && n=$((n + 1)) ;;
+        esac
+    done
+    [ "$n" -gt 0 ] && echo "  - ${n} MCP config file(s) with the 'databricks' server"
+    [ -n "$hook" ] && grep -q 'check_update.sh' "$hook" 2>/dev/null && echo "  - Claude update hook"
+    [ -n "$state_dir" ] && [ -d "$state_dir" ] && echo "  - MCP server runtime / state ($(printf '%s' "$state_dir" | sed "s#$HOME#~#"))"
+    [ -n "$plugin_keys" ] && echo "  - Claude Code plugin: $(printf '%s' "$plugin_keys" | tr '\n' ' ')"
+    return 0  # never let the last test's exit status trip `set -e` in the caller
+}
+
+# Project-scope artifacts under $1 (what a project uninstall from that dir removes).
+project_leftovers_summary() {
+    local dir=$1
+    _leftovers_summary "$dir/.claude/settings.json" "$dir/.ai-dev-kit" "$(plugin_keys_project "$dir")" \
+        "$dir/.claude/skills" "$dir/.cursor/skills" "$dir/.github/skills" \
+        "$dir/.agents/skills" "$dir/.gemini/skills" "$dir/.windsurf/skills" \
+        "$dir/.opencode/skills" "$dir/.kiro/skills" \
+        -- \
+        "$dir/.mcp.json|json:mcpServers" "$dir/.cursor/mcp.json|json:mcpServers" "$dir/.vscode/mcp.json|json:servers" \
+        "$dir/.codex/config.toml|toml" "$dir/.gemini/settings.json|json:mcpServers" \
+        "$dir/opencode.json|json:mcp" "$dir/.kiro/settings/mcp.json|json:mcpServers"
+}
+
+# Global/user-scope artifacts (what a --global uninstall removes).
+global_leftovers_summary() {
+    local install_dir="${AIDEVKIT_HOME:-$HOME/.ai-dev-kit}"
+    _leftovers_summary "$HOME/.claude/settings.json" "$install_dir" "$(plugin_keys_global)" \
+        "$HOME/.claude/skills" "$HOME/.cursor/skills" "$HOME/.github/skills" \
+        "$HOME/.agents/skills" "$HOME/.gemini/skills" "$HOME/.gemini/antigravity/skills" \
+        "$HOME/.codeium/windsurf/skills" "$HOME/.config/opencode/skills" "$HOME/.kiro/skills" \
+        -- \
+        "$HOME/.claude.json|json:mcpServers" "$HOME/.codex/config.toml|toml" "$HOME/.gemini/settings.json|json:mcpServers" \
+        "$HOME/.gemini/antigravity/mcp_config.json|json:mcpServers" "$HOME/.codeium/windsurf/mcp_config.json|json:mcpServers" \
+        "$HOME/.config/opencode/opencode.json|json:mcp" "$HOME/.kiro/settings/mcp.json|json:mcpServers"
+}
+
+# Very noticeable end-of-run box warning that files remain in the OTHER scope.
+# $1 = headline, $2 = detail line, $3 = summary lines, $4 = how-to-remove action.
+leftovers_box() {
+    local headline=$1 detail=$2 summary=$3 action=$4
+    local bar="  ${Y}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo ""
+    echo -e "$bar"
+    echo -e "  ${Y}${B}${headline}${N}"
+    echo -e "$bar"
+    echo -e "  ${D}${detail}${N}"
+    echo -e "$summary"
+    echo -e "  ${Y}${action}${N}"
+    echo -e "$bar"
+}
+
+# Warn (after a global uninstall) that project-scoped files remain in $1.
+warn_project_leftovers() {
+    leftovers_box "⚠  PROJECT-LEVEL AI DEV KIT FILES STILL REMAIN" \
+        "This global uninstall did not touch project-scoped files in: ${B}$1${N}" \
+        "$2" \
+        "Re-run the uninstaller from that folder ${B}without --global${N}${Y} to remove them."
+}
+
+# Warn (after a project uninstall) that global/user-level files remain.
+warn_global_leftovers() {
+    leftovers_box "⚠  GLOBAL AI DEV KIT FILES STILL REMAIN" \
+        "This project uninstall did not touch global (user-level) files:" \
+        "$1" \
+        "Re-run the uninstaller with ${B}--global${N}${Y} to remove them."
+}
+
+# Remove the plugin from the CURRENT uninstall scope via the official CLI (atomic
+# across the shared plugin state — we never hand-edit it). Removes every detected
+# "name@marketplace" key (the plugin may come from any marketplace). A project
+# install can be 'project' (.claude/settings.json) or 'local' (settings.local.json),
+# so a project uninstall tries both CLI scopes. If nothing could be removed (CLI
+# missing or every attempt failed) this is a hard error that reports whether the
+# rest of the uninstall completed and prints the exact command to run manually.
+# $1 = count of other AI Dev Kit artifacts already removed this run; $2 = keys.
+remove_claude_plugin() {
+    local others_removed=$1 keys=$2
+    local scopes cmd_scope
+    if [ "$SCOPE" = "project" ]; then scopes="project local"; cmd_scope="project"; else scopes="user"; cmd_scope="user"; fi
+    if command -v claude >/dev/null 2>&1; then
+        local k sc removed=false
+        while IFS= read -r k; do
+            [ -z "$k" ] && continue
+            for sc in $scopes; do
+                # Subcommand name has varied across versions (uninstall vs remove) — try both.
+                if claude plugin uninstall "$k" -y --scope "$sc" >/dev/null 2>&1 \
+                   || claude plugin remove "$k" -y --scope "$sc" >/dev/null 2>&1; then
+                    msg "removed Claude Code plugin ${k} (${sc} scope)"
+                    removed=true
+                fi
+            done
+        done <<< "$keys"
+        [ "$removed" = true ] && return 0
+    fi
+    local partial="" alt="" manual="" k
+    [ "$others_removed" -gt 0 ] && partial="Skills, MCP server, and config WERE removed (partial uninstall). "
+    [ "$SCOPE" = "project" ] && alt=" (or --scope local)"
+    while IFS= read -r k; do [ -n "$k" ] && manual="${manual:+$manual; }claude plugin uninstall ${k} --scope ${cmd_scope}"; done <<< "$keys"
+    die "Could not remove the Claude Code plugin. ${partial}Finish it manually: ${B}${manual}${N}${alt}"
+}
+
+run_uninstall() {
+    local base_dir install_dir state_dir
+    # Mirror install: if scope wasn't set explicitly, ask (interactive, non --yes)
+    # so a user who did a global install isn't silently told "nothing to uninstall
+    # for project scope". Non-interactive/--yes keeps the documented 'project' default.
+    # Ask for scope with the same selector install uses, unless it was set
+    # explicitly (-g/--global, DEVKIT_SCOPE) or we're non-interactive/--yes.
+    if [ "$SCOPE_EXPLICIT" = false ] && [ "$ASSUME_YES" != true ]; then
+        SCOPE_PROMPT_TITLE="Select uninstall scope" SCOPE_PROMPT_VERB="Remove from" prompt_scope
+        # renders: "Remove from current directory ..." / "Remove from home directory ..."
+    fi
+    [ "$SCOPE" = "global" ] && base_dir="$HOME" || base_dir="$(pwd)"
+    install_dir="${AIDEVKIT_HOME:-$HOME/.ai-dev-kit}"
+    [ "$SCOPE" = "global" ] && state_dir="$install_dir" || state_dir="$base_dir/.ai-dev-kit"
+    VENV_PYTHON="$install_dir/.venv/bin/python"
+
+    # Scope strictly gates locations. The installer writes project artifacts under
+    # the project dir and global artifacts under $HOME; a project uninstall must
+    # never touch $HOME configs (and vice-versa), or it would clobber the other
+    # scope's install. The few tools that always use $HOME even for project scope
+    # (antigravity/windsurf/opencode/kiro) are therefore only cleaned in --global.
+    local skill_roots mcp_targets hook_targets
+    if [ "$SCOPE" = "global" ]; then
+        skill_roots=(
+            "$HOME/.claude/skills" "$HOME/.cursor/skills" "$HOME/.github/skills"
+            "$HOME/.agents/skills" "$HOME/.gemini/skills"
+            "$HOME/.gemini/antigravity/skills" "$HOME/.codeium/windsurf/skills"
+            "$HOME/.config/opencode/skills" "$HOME/.kiro/skills"
+        )
+        mcp_targets=(
+            "$HOME/.claude.json|json:mcpServers"
+            "$HOME/.codex/config.toml|toml"
+            "$HOME/.gemini/settings.json|json:mcpServers"
+            "$HOME/.gemini/antigravity/mcp_config.json|json:mcpServers"
+            "$HOME/.codeium/windsurf/mcp_config.json|json:mcpServers"
+            "$HOME/.config/opencode/opencode.json|json:mcp"
+            "$HOME/.kiro/settings/mcp.json|json:mcpServers"
+        )
+        hook_targets=("$HOME/.claude/settings.json")
+    else
+        skill_roots=(
+            "$base_dir/.claude/skills" "$base_dir/.cursor/skills" "$base_dir/.github/skills"
+            "$base_dir/.agents/skills" "$base_dir/.gemini/skills" "$base_dir/.windsurf/skills"
+            "$base_dir/.opencode/skills" "$base_dir/.kiro/skills"
+        )
+        mcp_targets=(
+            "$base_dir/.mcp.json|json:mcpServers"
+            "$base_dir/.cursor/mcp.json|json:mcpServers" "$base_dir/.vscode/mcp.json|json:servers"
+            "$base_dir/.codex/config.toml|toml"
+            "$base_dir/.gemini/settings.json|json:mcpServers"
+            "$base_dir/opencode.json|json:mcp"
+            "$base_dir/.kiro/settings/mcp.json|json:mcpServers"
+        )
+        hook_targets=("$base_dir/.claude/settings.json")
+    fi
+
+    # ── Build the plan (paths that actually exist / contain our entries) ──
+    local -a plan_skills=() plan_mcp=() plan_hooks=() plan_runtime=() plan_state=()
+    local root name
+    for root in "${skill_roots[@]}"; do
+        [ -d "$root" ] || continue
+        for name in $UNINSTALL_SKILL_NAMES; do
+            [ -d "$root/$name" ] && plan_skills+=("$root/$name")
+        done
+    done
+    local entry path kind
+    for entry in "${mcp_targets[@]}"; do
+        path="${entry%%|*}"; kind="${entry#*|}"
+        case "$kind" in
+            json:*) mcp_json_has_databricks "$path" "${kind#json:}" && plan_mcp+=("$entry") ;;
+            toml)   [ -f "$path" ] && grep -qF 'mcp_servers.databricks' "$path" 2>/dev/null && plan_mcp+=("$entry") ;;
+        esac
+    done
+    for path in "${hook_targets[@]}"; do
+        [ -f "$path" ] && grep -q 'check_update.sh' "$path" 2>/dev/null && plan_hooks+=("$path")
+    done
+    # The shared MCP runtime (~/.ai-dev-kit) left by older installs is global; only
+    # remove it on a global uninstall. A project uninstall leaves it so other
+    # projects/global keep working.
+    if [ "$SCOPE" = "global" ]; then
+        [ -d "$install_dir" ] && plan_runtime+=("$install_dir")
+    fi
+    # On a global uninstall state_dir IS the runtime dir; when that dir is already in
+    # plan_runtime the state files inside it are removed along with it — planning them
+    # separately would double-delete (and double-list them in the plan).
+    if [[ " ${plan_runtime[*]} " != *" $state_dir "* ]]; then
+        for path in "$state_dir/.installed-skills" "$state_dir/.skills-profile" "$state_dir/version"; do
+            [ -f "$path" ] && plan_state+=("$path")
+        done
+    fi
+    # Project-scope leftover marker dir
+    [ "$SCOPE" = "project" ] && [ -d "$base_dir/.ai-dev-kit" ] && plan_state+=("$base_dir/.ai-dev-kit/")
+
+    # Claude Code plugin at the CURRENT scope — collect the enabled "name@marketplace"
+    # key(s) so any marketplace is matched; these are what we remove.
+    local plugin_keys="" plan_plugin=false plugin_count=0 k
+    if [ "$SCOPE" = "global" ]; then plugin_keys=$(plugin_keys_global); else plugin_keys=$(plugin_keys_project "$base_dir"); fi
+    [ -n "$plugin_keys" ] && { plan_plugin=true; plugin_count=$(printf '%s\n' "$plugin_keys" | grep -c .); }
+
+    # Warn about artifacts left behind in the OTHER scope. A global uninstall looks
+    # for project-scope files in the current folder ($PWD); a project uninstall looks
+    # for global/user-level files. Skip the $PWD scan when $PWD is $HOME (there the
+    # project and global paths coincide and are already handled by the global side).
+    local project_leftovers="" global_leftovers=""
+    if [ "$SCOPE" = "global" ]; then
+        [ "$PWD" != "$HOME" ] && project_leftovers=$(project_leftovers_summary "$PWD")
+    else
+        [ "$base_dir" != "$HOME" ] && global_leftovers=$(global_leftovers_summary)
+    fi
+
+    local total=$(( ${#plan_skills[@]} + ${#plan_mcp[@]} + ${#plan_hooks[@]} + ${#plan_runtime[@]} + ${#plan_state[@]} + plugin_count ))
+    if [ "$total" -eq 0 ]; then
+        ok "Nothing to uninstall for ${B}$SCOPE${N} scope at ${D}${base_dir}${N} — no AI Dev Kit artifacts found."
+        [ "$SCOPE" = "project" ] && [ -z "$global_leftovers" ] && msg "${D}Tip: pass --global to remove a global install.${N}"
+        [ -n "$project_leftovers" ] && warn_project_leftovers "$PWD" "$project_leftovers"
+        [ -n "$global_leftovers" ]  && warn_global_leftovers "$global_leftovers"
+        exit 0
+    fi
+
+    step "Uninstall plan (${SCOPE} scope)"
+    [ ${#plan_skills[@]}  -gt 0 ] && { echo -e "  ${B}Skill folders (${#plan_skills[@]}):${N}"; for p in "${plan_skills[@]}"; do echo "    ${p/#$HOME/~}"; done; }
+    [ ${#plan_mcp[@]}     -gt 0 ] && { echo -e "  ${B}MCP config — remove 'databricks' entry (${#plan_mcp[@]}):${N}"; for e in "${plan_mcp[@]}"; do echo "    ${e%%|*}" | sed "s#$HOME#~#"; done; }
+    [ ${#plan_hooks[@]}   -gt 0 ] && { echo -e "  ${B}Claude update hook (${#plan_hooks[@]}):${N}"; for p in "${plan_hooks[@]}"; do echo "    ${p/#$HOME/~}"; done; }
+    [ ${#plan_runtime[@]} -gt 0 ] && { echo -e "  ${B}MCP server runtime:${N}"; for p in "${plan_runtime[@]}"; do echo "    ${p/#$HOME/~}"; done; }
+    [ ${#plan_state[@]}   -gt 0 ] && { echo -e "  ${B}State files:${N}"; for p in "${plan_state[@]}"; do echo "    ${p/#$HOME/~}"; done; }
+    [ "$plan_plugin" = true ] && {
+        echo -e "  ${B}Claude Code plugin:${N}"
+        while IFS= read -r k; do [ -n "$k" ] && echo -e "    ${k} ${D}(removed via the claude CLI, ${SCOPE} scope)${N}"; done <<< "$plugin_keys"
+        echo -e "  ${Y}${B}⚠  Heads up: the AI Dev Kit Claude Code plugin will also be removed.${N}"
+    }
+    echo ""
+    msg "${D}Config files are backed up to <file>.bak before editing.${N}"
+
+    if [ "$DRY_RUN" = true ]; then
+        [ -n "$project_leftovers" ] && warn_project_leftovers "$PWD" "$project_leftovers"
+        [ -n "$global_leftovers" ]  && warn_global_leftovers "$global_leftovers"
+        ok "Dry run — nothing was changed. Re-run without --dry-run to apply."
+        exit 0
+    fi
+
+    if [ "$ASSUME_YES" != true ]; then
+        local reply=""
+        if { exec 3</dev/tty; } 2>/dev/null; then
+            printf "  ${Y}Remove these %d item(s)?${N} [y/N] " "$total"
+            read -r reply <&3 || reply=""
+            exec 3<&-
+        else
+            die "No terminal to confirm on. Re-run with -y/--yes to proceed non-interactively (or --dry-run to preview)."
+        fi
+        case "$reply" in [yY]|[yY][eE][sS]) ;; *) die "Aborted — nothing removed." ;; esac
+    fi
+
+    step "Removing"
+    local p e
+    for p in "${plan_skills[@]}"; do rm -rf "$p" && msg "removed ${p/#$HOME/~}"; done
+    for e in "${plan_mcp[@]}"; do
+        path="${e%%|*}"; kind="${e#*|}"
+        case "$kind" in
+            json:*) uninstall_remove_json_key "$path" "${kind#json:}" && msg "cleaned ${path/#$HOME/~}" ;;
+            toml)   uninstall_remove_toml_block "$path" && msg "cleaned ${path/#$HOME/~}" ;;
+        esac
+    done
+    for p in "${plan_hooks[@]}"; do uninstall_remove_claude_hook "$p" && msg "cleaned hook in ${p/#$HOME/~}"; done
+    for p in "${plan_runtime[@]}"; do rm -rf "$p" && msg "removed ${p/#$HOME/~}"; done
+    for p in "${plan_state[@]}"; do rm -rf "$p" && msg "removed ${p/#$HOME/~}"; done
+    [ "$plan_plugin" = true ] && remove_claude_plugin "$(( total - plugin_count ))" "$plugin_keys"
+
+    echo ""
+    ok "AI Dev Kit uninstalled (${SCOPE} scope)."
+    msg "${D}Other scopes and per-editor .bak backups were left untouched.${N}"
+    [ -n "$project_leftovers" ] && warn_project_leftovers "$PWD" "$project_leftovers"
+    [ -n "$global_leftovers" ]  && warn_global_leftovers "$global_leftovers"
+    exit 0
+}
+
+# Set configuration URLs after parsing branch argument
+RAW_URL="https://raw.githubusercontent.com/databricks-solutions/ai-dev-kit/${BRANCH}"
+INSTALL_DIR="${AIDEVKIT_HOME:-$HOME/.ai-dev-kit}"
+# VENV_PYTHON is used by --uninstall as a fallback Python interpreter for safely
+# editing leftover JSON config from older installs that included the MCP server.
+VENV_DIR="$INSTALL_DIR/.venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
+
+# ─── Interactive helpers ────────────────────────────────────────
+# Reads from /dev/tty so prompts work even when piped via curl | bash
+
+# True if we have an interactive tty we can read from.
+# `[ -e /dev/tty ]` is not safe here — on macOS the device node always exists
+# even when the process has no controlling terminal, so existence does not
+# imply we can open it. We check stdin first (normal interactive runs) and
+# fall back to attempting to open /dev/tty (needed for `curl … | bash` where
+# stdin is piped but a controlling terminal is still available).
+is_interactive() {
+    [ -t 0 ] || ( : < /dev/tty ) 2>/dev/null
+}
+
+# Simple text prompt with default value
+prompt() {
+    local prompt_text=$1
+    local default_value=$2
+    local result=""
+
+    if [ "$SILENT" = true ]; then
+        echo "$default_value"
+        return
+    fi
+
+    if ( : < /dev/tty ) 2>/dev/null; then
+        printf "  %b [%s]: " "$prompt_text" "$default_value" > /dev/tty
+        read -r result < /dev/tty
+    elif [ -t 0 ]; then
+        printf "  %b [%s]: " "$prompt_text" "$default_value"
+        read -r result
+    else
+        echo "$default_value"
+        return
+    fi
+
+    if [ -z "$result" ]; then
+        echo "$default_value"
+    else
+        echo "$result"
+    fi
+}
+
+# Interactive checkbox selector using arrow keys + space/enter + "Done" button
+# Outputs space-separated selected values to stdout
+# Args: "Label|value|on_or_off|hint[|lock]" ...
+#   A 5th "lock" field marks the item as always-on and non-toggleable.
+checkbox_select() {
+    # Parse items
+    local -a labels=()
+    local -a values=()
+    local -a states=()
+    local -a hints=()
+    local -a locked=()
+    local count=0
+
+    for item in "$@"; do
+        IFS='|' read -r label value state hint lock <<< "$item"
+        labels+=("$label")
+        values+=("$value")
+        hints+=("$hint")
+        if [ "$lock" = "lock" ]; then
+            locked+=(1)
+            states+=(1)  # locked items are always selected
+        else
+            locked+=(0)
+            [ "$state" = "on" ] && states+=(1) || states+=(0)
+        fi
+        count=$((count + 1))
+    done
+
+    local cursor=0
+    local total_rows=$((count + 2))  # items + blank line + Done button
+
+    # Draw the checkbox list + Done button
+    _checkbox_draw() {
+        local i
+        for i in $(seq 0 $((count - 1))); do
+            local check=" "
+            [ "${states[$i]}" = "1" ] && check="\033[0;32m✓\033[0m"
+            local arrow="  "
+            [ "$i" = "$cursor" ] && arrow="\033[0;34m❯\033[0m "
+            local hint_style="\033[2m"
+            [ "${states[$i]}" = "1" ] && hint_style="\033[0;32m"
+            printf "\033[2K  %b[%b] %-16s %b%s\033[0m\n" "$arrow" "$check" "${labels[$i]}" "$hint_style" "${hints[$i]}" > /dev/tty
+        done
+        # Blank separator line
+        printf "\033[2K\n" > /dev/tty
+        # Done button
+        if [ "$cursor" = "$count" ]; then
+            printf "\033[2K  \033[0;34m❯\033[0m \033[1;32m[ Confirm ]\033[0m\n" > /dev/tty
+        else
+            printf "\033[2K    \033[2m[ Confirm ]\033[0m\n" > /dev/tty
+        fi
+    }
+
+    # Print instructions
+    printf "\n  \033[2m↑/↓ navigate · space/enter select · enter on Confirm to finish\033[0m\n\n" > /dev/tty
+
+    # Hide cursor
+    # Hide cursor and disable line wrap (DECAWM). With wrap off the terminal
+    # clips overlong lines to one row, so the cursor-up redraw can't desync.
+    printf "\033[?25l\033[?7l" > /dev/tty
+
+    # Restore cursor on exit (Ctrl+C safety)
+    trap 'printf "\033[?25h\033[?7h" > /dev/tty 2>/dev/null' EXIT
+
+    # Initial draw
+    _checkbox_draw
+
+    # Input loop
+    while true; do
+        # Move back to top of drawn area and redraw
+        printf "\033[%dA" "$total_rows" > /dev/tty
+        _checkbox_draw
+
+        # Read input
+        local key=""
+        IFS= read -rsn1 key < /dev/tty 2>/dev/null
+
+        if [ "$key" = $'\x1b' ]; then
+            local s1="" s2=""
+            read -rsn1 s1 < /dev/tty 2>/dev/null
+            read -rsn1 s2 < /dev/tty 2>/dev/null
+            if [ "$s1" = "[" ]; then
+                case "$s2" in
+                    A) [ "$cursor" -gt 0 ] && cursor=$((cursor - 1)) ;;  # Up
+                    B) [ "$cursor" -lt "$count" ] && cursor=$((cursor + 1)) ;;  # Down (can go to Done)
+                esac
+            fi
+        elif [ "$key" = " " ] || [ "$key" = "" ]; then
+            # Space or Enter
+            if [ "$cursor" -lt "$count" ]; then
+                # On a checkbox item — toggle it (locked items can't be changed)
+                if [ "${locked[$cursor]}" = "1" ]; then
+                    :  # required item — ignore toggle
+                elif [ "${states[$cursor]}" = "1" ]; then
+                    states[$cursor]=0
+                else
+                    states[$cursor]=1
+                fi
+            else
+                # On the Confirm button — done
+                printf "\033[%dA" "$total_rows" > /dev/tty
+                _checkbox_draw
+                break
+            fi
+        fi
+    done
+
+    # Show cursor again
+    printf "\033[?25h\033[?7h" > /dev/tty
+    trap - EXIT
+
+    # Build result
+    local selected=""
+    for i in $(seq 0 $((count - 1))); do
+        if [ "${states[$i]}" = "1" ]; then
+            selected="${selected:+$selected }${values[$i]}"
+        fi
+    done
+
+    echo "$selected"
+}
+
+# Interactive single-select using arrow keys + enter + "Confirm" button
+# Outputs the selected value to stdout
+# Args: "Label|value|selected|hint" ...  (exactly one should have selected=on)
+radio_select() {
+    # Parse items
+    local -a labels=()
+    local -a values=()
+    local -a hints=()
+    local count=0
+    local selected=0
+
+    for item in "$@"; do
+        IFS='|' read -r label value state hint <<< "$item"
+        labels+=("$label")
+        values+=("$value")
+        hints+=("$hint")
+        [ "$state" = "on" ] && selected=$count
+        count=$((count + 1))
+    done
+
+    local cursor=0
+    local total_rows=$((count + 2))  # items + blank line + Confirm button
+
+    _radio_draw() {
+        local i
+        for i in $(seq 0 $((count - 1))); do
+            local dot="○"
+            local dot_color="\033[2m"
+            [ "$i" = "$selected" ] && dot="●" && dot_color="\033[0;32m"
+            local arrow="  "
+            [ "$i" = "$cursor" ] && arrow="\033[0;34m❯\033[0m "
+            local hint_style="\033[2m"
+            [ "$i" = "$selected" ] && hint_style="\033[0;32m"
+            printf "\033[2K  %b%b%b %-20s %b%s\033[0m\n" "$arrow" "$dot_color" "$dot" "${labels[$i]}" "$hint_style" "${hints[$i]}" > /dev/tty
+        done
+        printf "\033[2K\n" > /dev/tty
+        if [ "$cursor" = "$count" ]; then
+            printf "\033[2K  \033[0;34m❯\033[0m \033[1;32m[ Confirm ]\033[0m\n" > /dev/tty
+        else
+            printf "\033[2K    \033[2m[ Confirm ]\033[0m\n" > /dev/tty
+        fi
+    }
+
+    printf "\n  \033[2m↑/↓ navigate · enter confirm · space preview\033[0m\n\n" > /dev/tty
+    # Hide cursor and disable line wrap (DECAWM). With wrap off the terminal
+    # clips overlong lines to one row, so the cursor-up redraw can't desync.
+    printf "\033[?25l\033[?7l" > /dev/tty
+    trap 'printf "\033[?25h\033[?7h" > /dev/tty 2>/dev/null' EXIT
+
+    _radio_draw
+
+    while true; do
+        printf "\033[%dA" "$total_rows" > /dev/tty
+        _radio_draw
+
+        local key=""
+        IFS= read -rsn1 key < /dev/tty 2>/dev/null
+
+        if [ "$key" = $'\x1b' ]; then
+            local s1="" s2=""
+            read -rsn1 s1 < /dev/tty 2>/dev/null
+            read -rsn1 s2 < /dev/tty 2>/dev/null
+            if [ "$s1" = "[" ]; then
+                case "$s2" in
+                    A) [ "$cursor" -gt 0 ] && cursor=$((cursor - 1)) ;;
+                    B) [ "$cursor" -lt "$count" ] && cursor=$((cursor + 1)) ;;
+                esac
+            fi
+        elif [ "$key" = "" ]; then
+            # Enter — select current item and confirm immediately
+            if [ "$cursor" -lt "$count" ]; then
+                selected=$cursor
+            fi
+            printf "\033[%dA" "$total_rows" > /dev/tty
+            _radio_draw
+            break
+        elif [ "$key" = " " ]; then
+            # Space — select but keep browsing
+            if [ "$cursor" -lt "$count" ]; then
+                selected=$cursor
+            fi
+        fi
+    done
+
+    printf "\033[?25h\033[?7h" > /dev/tty
+    trap - EXIT
+
+    echo "${values[$selected]}"
+}
+
+# ─── Tool detection & selection ─────────────────────────────────
+detect_tools() {
+    # If provided via --tools flag or TOOLS env var, skip detection and prompts
+    if [ -n "$USER_TOOLS" ]; then
+        TOOLS=$(echo "$USER_TOOLS" | tr ',' ' ')
+        return
+    elif [ -n "$TOOLS" ]; then
+        # TOOLS env var already set, just normalize it
+        TOOLS=$(echo "$TOOLS" | tr ',' ' ')
+        return
+    fi
+
+    # Auto-detect what's installed
+    local has_claude=false
+    local has_cursor=false
+    local has_codex=false
+    local has_copilot=false
+    local has_gemini=false
+    local has_antigravity=false
+    local has_windsurf=false
+    local has_opencode=false
+    local has_kiro=false
+
+    command -v claude >/dev/null 2>&1 && has_claude=true
+    { [ -d "/Applications/Cursor.app" ] || command -v cursor >/dev/null 2>&1; } && has_cursor=true
+    command -v codex >/dev/null 2>&1 && has_codex=true
+    { [ -d "/Applications/Visual Studio Code.app" ] || command -v code >/dev/null 2>&1; } && has_copilot=true
+    { command -v gemini >/dev/null 2>&1 || [ -f "$HOME/.gemini/local/gemini" ]; } && has_gemini=true
+    { [ -d "/Applications/Antigravity.app" ] || command -v antigravity >/dev/null 2>&1; } && has_antigravity=true
+    { [ -d "/Applications/Windsurf.app" ] || command -v windsurf >/dev/null 2>&1; } && has_windsurf=true
+    command -v opencode >/dev/null 2>&1 && has_opencode=true
+    { [ -d "/Applications/Kiro.app" ] || command -v kiro >/dev/null 2>&1; } && has_kiro=true
+
+    # Build checkbox items: "Label|value|on_or_off|hint"
+    local claude_state="off" cursor_state="off" codex_state="off" copilot_state="off" gemini_state="off" antigravity_state="off" windsurf_state="off" opencode_state="off" kiro_state="off"
+    local claude_hint="not found" cursor_hint="not found" codex_hint="not found" copilot_hint="not found" gemini_hint="not found" antigravity_hint="not found" windsurf_hint="not found" opencode_hint="not found" kiro_hint="not found"
+    [ "$has_claude" = true ]        && claude_state="on"        && claude_hint="detected"
+    [ "$has_cursor" = true ]        && cursor_state="on"        && cursor_hint="detected"
+    [ "$has_codex" = true ]         && codex_state="on"         && codex_hint="detected"
+    [ "$has_copilot" = true ]       && copilot_state="on"       && copilot_hint="detected"
+    [ "$has_gemini" = true ]        && gemini_state="on"        && gemini_hint="detected"
+    [ "$has_antigravity" = true ]   && antigravity_state="on"   && antigravity_hint="detected"
+    [ "$has_windsurf" = true ]      && windsurf_state="on"      && windsurf_hint="detected"
+    [ "$has_opencode" = true ]      && opencode_state="on"      && opencode_hint="detected"
+    [ "$has_kiro" = true ]          && kiro_state="on"          && kiro_hint="detected"
+
+    # If nothing detected, pre-select claude as default
+    if [ "$has_claude" = false ] && [ "$has_cursor" = false ] && [ "$has_codex" = false ] && [ "$has_copilot" = false ] && [ "$has_gemini" = false ] && [ "$has_antigravity" = false ] && [ "$has_windsurf" = false ] && [ "$has_opencode" = false ] && [ "$has_kiro" = false ]; then
+        claude_state="on"
+        claude_hint="default"
+    fi
+
+    # Interactive or fallback
+    if [ "$SILENT" = false ] && is_interactive; then
+        [ "$SILENT" = false ] && echo ""
+        [ "$SILENT" = false ] && echo -e "  ${B}Select tools to install for:${N}"
+
+        TOOLS=$(checkbox_select \
+            "Claude Code|claude|${claude_state}|${claude_hint}" \
+            "Cursor|cursor|${cursor_state}|${cursor_hint}" \
+            "GitHub Copilot|copilot|${copilot_state}|${copilot_hint}" \
+            "OpenAI Codex|codex|${codex_state}|${codex_hint}" \
+            "Gemini CLI|gemini|${gemini_state}|${gemini_hint}" \
+            "Antigravity|antigravity|${antigravity_state}|${antigravity_hint}" \
+            "Windsurf|windsurf|${windsurf_state}|${windsurf_hint}" \
+            "OpenCode|opencode|${opencode_state}|${opencode_hint}" \
+            "Kiro|kiro|${kiro_state}|${kiro_hint}" \
+        )
+    else
+        # Silent: use detected defaults
+        local tools=""
+        [ "$has_claude" = true ]        && tools="claude"
+        [ "$has_cursor" = true ]        && tools="${tools:+$tools }cursor"
+        [ "$has_copilot" = true ]       && tools="${tools:+$tools }copilot"
+        [ "$has_codex" = true ]         && tools="${tools:+$tools }codex"
+        [ "$has_gemini" = true ]        && tools="${tools:+$tools }gemini"
+        [ "$has_antigravity" = true ]   && tools="${tools:+$tools }antigravity"
+        [ "$has_windsurf" = true ]      && tools="${tools:+$tools }windsurf"
+        [ "$has_opencode" = true ]      && tools="${tools:+$tools }opencode"
+        [ "$has_kiro" = true ]          && tools="${tools:+$tools }kiro"
+        [ -z "$tools" ] && tools="claude"
+        TOOLS="$tools"
+    fi
+
+    # Validate we have at least one
+    if [ -z "$TOOLS" ]; then
+        warn "No tools selected, defaulting to Claude Code"
+        TOOLS="claude"
+    fi
+}
+
+# ─── Databricks profile selection ─────────────────────────────
+prompt_profile() {
+    # If provided via --profile flag (non-default), skip prompt
+    if [ "$PROFILE" != "DEFAULT" ]; then
+        return
+    fi
+
+    # Skip in silent mode or non-interactive
+    if [ "$SILENT" = true ] || ! is_interactive; then
+        return
+    fi
+
+    # Detect existing profiles from ~/.databrickscfg
+    local cfg_file="$HOME/.databrickscfg"
+    local -a profiles=()
+
+    if [ -f "$cfg_file" ]; then
+        while IFS= read -r line; do
+            # Match [PROFILE_NAME] sections
+            if [[ "$line" =~ ^\[([a-zA-Z0-9_-]+)\]$ ]]; then
+                profiles+=("${BASH_REMATCH[1]}")
+            fi
+        done < "$cfg_file"
+    fi
+
+    echo ""
+    echo -e "  ${B}Select Databricks profile${N}"
+
+    if [ ${#profiles[@]} -gt 0 ] && is_interactive; then
+        # Build radio items: "Label|value|on_or_off|hint"
+        local -a items=()
+        for p in "${profiles[@]}"; do
+            local state="off"
+            local hint=""
+            [ "$p" = "DEFAULT" ] && state="on" && hint="default"
+            items+=("${p}|${p}|${state}|${hint}")
+        done
+        
+        # Add custom profile option at the end
+        items+=("Custom profile name...|__CUSTOM__|off|Enter a custom profile name")
+
+        # If no DEFAULT profile exists, pre-select the first one
+        local has_default=false
+        for p in "${profiles[@]}"; do
+            [ "$p" = "DEFAULT" ] && has_default=true
+        done
+        if [ "$has_default" = false ]; then
+            items[0]=$(echo "${items[0]}" | sed 's/|off|/|on|/')
+        fi
+
+        local selected_profile
+        selected_profile=$(radio_select "${items[@]}")
+        
+        # If custom was selected, prompt for name
+        if [ "$selected_profile" = "__CUSTOM__" ]; then
+            echo ""
+            local custom_name
+            custom_name=$(prompt "Enter profile name" "DEFAULT")
+            PROFILE="$custom_name"
+        else
+            PROFILE="$selected_profile"
+        fi
+    else
+        echo -e "  ${D}No ~/.databrickscfg found. You can authenticate after install.${N}"
+        echo ""
+        local selected
+        selected=$(prompt "Profile name" "DEFAULT")
+        PROFILE="$selected"
+    fi
+}
+
+# ─── Skill profile selection ──────────────────────────────────
+# Exact-match membership test: _in_list <name> <space-separated list>
+# (`grep -w` is unsafe here — `-` is a word boundary, so `grep -w databricks`
+# would match `databricks-jobs` etc.)
+_in_list() { echo "$2" | tr ' ' '\n' | grep -Fxq "$1"; }
+
+# Map an old skill name to its replacement (prints the new name, or fails)
+migrate_renamed_skill() {
+    local entry
+    for entry in $RENAMED_SKILLS; do
+        if [ "${entry%%:*}" = "$1" ]; then
+            echo "${entry#*:}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Resolve selected skills from profile names or explicit skill list,
+# bucketing each name into its source (mlflow / agent-skills).
+resolve_skills() {
+    fetch_agent_b_inventory
+
+    local mlflow_skills="" agent_b_skills=""
+
+    # Bucket one skill name into its source list (fails for unknown names)
+    _bucket() {
+        if _in_list "$1" "$MLFLOW_SKILLS"; then
+            mlflow_skills="${mlflow_skills:+$mlflow_skills }$1"
+        elif _in_list "$1" "$AGENT_B_STABLE $AGENT_B_EXPERIMENTAL"; then
+            agent_b_skills="${agent_b_skills:+$agent_b_skills }$1"
+        else
+            return 1
+        fi
+    }
+
+    # Dedupe + normalize whitespace (empty input stays truly empty so `[ -n ]` works)
+    _dedupe() { echo "$*" | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//'; }
+
+    _store_selection() {
+        SELECTED_MLFLOW_SKILLS=$(_dedupe "$mlflow_skills")
+        SELECTED_AGENT_B_SKILLS=$(_dedupe "$agent_b_skills")
+    }
+
+    # Agent skills selected by default: everything except the excluded list (and
+    # experimental skills when --experimental false)
+    _default_agent_b() {
+        local skill
+        for skill in $AGENT_B_STABLE $AGENT_B_EXPERIMENTAL; do
+            _in_list "$skill" "$AGENT_B_EXCLUDED" && continue
+            [ "$INSTALL_EXPERIMENTAL" = false ] && _in_list "$skill" "$AGENT_B_EXPERIMENTAL" && continue
+            agent_b_skills="${agent_b_skills:+$agent_b_skills }$skill"
+        done
+    }
+
+    # Priority 1: Explicit --skills flag (comma-separated skill names)
+    if [ -n "$USER_SKILLS" ]; then
+        local skill new_name
+        for skill in $(echo "$USER_SKILLS" | tr ',' ' '); do
+            if _bucket "$skill"; then
+                continue
+            fi
+            if new_name=$(migrate_renamed_skill "$skill"); then
+                warn "Skill '$skill' was renamed/replaced by '$new_name' — installing '$new_name'"
+                _bucket "$new_name" && continue
+            fi
+            die "Unknown skill: '$skill' (run with --list-skills to see available skills)"
+        done
+        _store_selection
+        return
+    fi
+
+    # Priority 2: --skills-profile flag or interactive selection
+    if [ -z "$SKILLS_PROFILE" ] || [ "$SKILLS_PROFILE" = "all" ]; then
+        mlflow_skills="$MLFLOW_SKILLS"
+        _default_agent_b
+        SELECTED_ALL_AGENT_B=true
+        _store_selection
+        return
+    fi
+
+    # Build union of selected profiles (comma-separated)
+    local names="$CORE_SKILLS"
+    local profile
+    for profile in $(echo "$SKILLS_PROFILE" | tr ',' ' '); do
+        case $profile in
+            all)
+                mlflow_skills="$MLFLOW_SKILLS"
+                agent_b_skills=""
+                _default_agent_b
+                SELECTED_ALL_AGENT_B=true
+                _store_selection
+                return
+                ;;
+            data-engineer)  names="$names $PROFILE_DATA_ENGINEER" ;;
+            analyst)        names="$names $PROFILE_ANALYST" ;;
+            ai-ml-engineer) names="$names $PROFILE_AIML_ENGINEER $PROFILE_AIML_MLFLOW" ;;
+            app-developer)  names="$names $PROFILE_APP_DEVELOPER" ;;
+            *)              warn "Unknown skill profile: $profile (ignored)" ;;
+        esac
+    done
+
+    local skill
+    for skill in $names; do
+        # Drop experimental agent skills from profiles when --experimental false
+        if [ "$INSTALL_EXPERIMENTAL" = false ] && _in_list "$skill" "$AGENT_B_EXPERIMENTAL"; then
+            continue
+        fi
+        _bucket "$skill" || warn "Skill '$skill' not found in any source (skipped)"
+    done
+    _store_selection
+}
+
+# Interactive skill profile selection (multi-select)
+prompt_skills_profile() {
+    # If provided via --skills or --skills-profile, skip interactive prompt
+    if [ -n "$USER_SKILLS" ] || [ -n "$SKILLS_PROFILE" ]; then
+        return
+    fi
+
+    # Skip in silent mode or non-interactive
+    if [ "$SILENT" = true ] || ! is_interactive; then
+        SKILLS_PROFILE="all"
+        return
+    fi
+
+    # Check for previous selection (scope-local first, then global fallback for upgrades)
+    local profile_file="$STATE_DIR/.skills-profile"
+    [ ! -f "$profile_file" ] && [ "$SCOPE" = "project" ] && profile_file="$INSTALL_DIR/.skills-profile"
+    if [ -f "$profile_file" ]; then
+        local prev_profile
+        prev_profile=$(cat "$profile_file")
+        if [ "$FORCE" != true ]; then
+            echo ""
+            local display_profile
+            display_profile=$(echo "$prev_profile" | tr ',' ', ')
+            local keep
+            keep=$(prompt "Previous skill profile: ${B}${display_profile}${N}. Keep? ${D}(Y/n)${N}" "y")
+            if [ "$keep" = "y" ] || [ "$keep" = "Y" ] || [ "$keep" = "yes" ] || [ -z "$keep" ]; then
+                SKILLS_PROFILE="$prev_profile"
+                return
+            fi
+        fi
+    fi
+
+    echo ""
+    echo -e "  ${B}Select skill profile(s)${N}"
+
+    # Custom checkbox with mutual exclusion: "All" deselects others, others deselect "All"
+    local all_count de_count an_count ai_count ap_count
+    all_count=$(_count_all_skills)
+    de_count=$(_count $CORE_SKILLS $PROFILE_DATA_ENGINEER)
+    an_count=$(_count $CORE_SKILLS $PROFILE_ANALYST)
+    ai_count=$(_count $CORE_SKILLS $PROFILE_AIML_ENGINEER $PROFILE_AIML_MLFLOW)
+    ap_count=$(_count $CORE_SKILLS $PROFILE_APP_DEVELOPER)
+    local -a p_labels=("All Skills" "Data Engineer" "Business Analyst" "AI/ML Engineer" "App Developer" "Custom")
+    local -a p_values=("all" "data-engineer" "analyst" "ai-ml-engineer" "app-developer" "custom")
+    local -a p_hints=("Install everything (${all_count} skills)" "Pipelines, Spark, Jobs, Streaming (${de_count} skills)" "Dashboards, SQL, Genie, Metrics (${an_count} skills)" "Agents, RAG, Vector Search, MLflow (${ai_count} skills)" "Apps, Lakebase, Deployment (${ap_count} skills)" "Pick individual skills")
+    local -a p_states=(1 0 0 0 0 0)  # "All" selected by default
+    local p_count=6
+    local p_cursor=0
+    local p_total_rows=$((p_count + 2))
+
+    _profile_draw() {
+        local i
+        for i in $(seq 0 $((p_count - 1))); do
+            local check=" "
+            [ "${p_states[$i]}" = "1" ] && check="\033[0;32m✓\033[0m"
+            local arrow="  "
+            [ "$i" = "$p_cursor" ] && arrow="\033[0;34m❯\033[0m "
+            local hint_style="\033[2m"
+            [ "${p_states[$i]}" = "1" ] && hint_style="\033[0;32m"
+            printf "\033[2K  %b[%b] %-20s %b%s\033[0m\n" "$arrow" "$check" "${p_labels[$i]}" "$hint_style" "${p_hints[$i]}" > /dev/tty
+        done
+        printf "\033[2K\n" > /dev/tty
+        if [ "$p_cursor" = "$p_count" ]; then
+            printf "\033[2K  \033[0;34m❯\033[0m \033[1;32m[ Confirm ]\033[0m\n" > /dev/tty
+        else
+            printf "\033[2K    \033[2m[ Confirm ]\033[0m\n" > /dev/tty
+        fi
+    }
+
+    printf "\n  \033[2m↑/↓ navigate · space/enter select · enter on Confirm to finish\033[0m\n\n" > /dev/tty
+    # Hide cursor and disable line wrap (DECAWM). With wrap off the terminal
+    # clips overlong lines to one row, so the cursor-up redraw can't desync.
+    printf "\033[?25l\033[?7l" > /dev/tty
+    trap 'printf "\033[?25h\033[?7h" > /dev/tty 2>/dev/null' EXIT
+
+    _profile_draw
+
+    while true; do
+        printf "\033[%dA" "$p_total_rows" > /dev/tty
+        _profile_draw
+
+        local key=""
+        IFS= read -rsn1 key < /dev/tty 2>/dev/null
+
+        if [ "$key" = $'\x1b' ]; then
+            local s1="" s2=""
+            read -rsn1 s1 < /dev/tty 2>/dev/null
+            read -rsn1 s2 < /dev/tty 2>/dev/null
+            if [ "$s1" = "[" ]; then
+                case "$s2" in
+                    A) [ "$p_cursor" -gt 0 ] && p_cursor=$((p_cursor - 1)) ;;
+                    B) [ "$p_cursor" -lt "$p_count" ] && p_cursor=$((p_cursor + 1)) ;;
+                esac
+            fi
+        elif [ "$key" = " " ] || [ "$key" = "" ]; then
+            if [ "$p_cursor" -lt "$p_count" ]; then
+                # Toggle the current item
+                if [ "${p_states[$p_cursor]}" = "1" ]; then
+                    p_states[$p_cursor]=0
+                else
+                    p_states[$p_cursor]=1
+                    # Mutual exclusion: "All" (index 0) vs individual profiles (1-5)
+                    if [ "$p_cursor" = "0" ]; then
+                        # Selected "All" → deselect all others
+                        for j in $(seq 1 $((p_count - 1))); do p_states[$j]=0; done
+                    else
+                        # Selected an individual profile → deselect "All"
+                        p_states[0]=0
+                    fi
+                fi
+            else
+                # On Confirm — done
+                printf "\033[%dA" "$p_total_rows" > /dev/tty
+                _profile_draw
+                break
+            fi
+        fi
+    done
+
+    printf "\033[?25h\033[?7h" > /dev/tty
+    trap - EXIT
+
+    # Build result
+    local selected=""
+    for i in $(seq 0 $((p_count - 1))); do
+        if [ "${p_states[$i]}" = "1" ]; then
+            selected="${selected:+$selected }${p_values[$i]}"
+        fi
+    done
+
+    # Nothing selected — drop into the individual skill picker (custom) rather
+    # than silently installing everything.
+    if [ -z "$selected" ]; then
+        prompt_custom_skills ""
+        return
+    fi
+
+    # Check if "all" is selected
+    if echo "$selected" | grep -qw "all"; then
+        SKILLS_PROFILE="all"
+        return
+    fi
+
+    # Check if "custom" is selected — show individual skill picker
+    if echo "$selected" | grep -qw "custom"; then
+        prompt_custom_skills "$selected"
+        return
+    fi
+
+    # Store comma-separated profile names
+    SKILLS_PROFILE=$(echo "$selected" | tr ' ' ',')
+}
+
+# Custom individual skill picker
+# Display "Label|hint" for a skill name. Known skills get a friendly label and
+# hint; unknown/new ones fall back to the bare name so they still show up in the
+# picker as the upstream inventory grows. (case-based — no associative arrays,
+# so this stays compatible with the bash 3.2 that ships on macOS.)
+_skill_meta() {
+    case "$1" in
+        databricks-core)                       echo "Core|CLI auth, data exploration" ;;
+        databricks-docs)                       echo "Docs|Databricks documentation" ;;
+        databricks-python-sdk)                 echo "Python SDK|SDK, Connect, REST API" ;;
+        databricks-unity-catalog)              echo "Unity Catalog|System tables, volumes" ;;
+        databricks-pipelines)                  echo "Spark Pipelines|SDP/LDP, CDC, SCD Type 2" ;;
+        databricks-spark-structured-streaming) echo "Structured Streaming|Real-time streaming" ;;
+        databricks-jobs)                       echo "Jobs & Workflows|Multi-task orchestration" ;;
+        databricks-dabs)                       echo "Asset Bundles|DABs deployment" ;;
+        databricks-dbsql)                      echo "Databricks SQL|SQL warehouse queries" ;;
+        databricks-iceberg)                    echo "Iceberg|Apache Iceberg tables" ;;
+        databricks-lakeflow-connect)           echo "Lakeflow Connect|Managed ingestion connectors" ;;
+        databricks-zerobus-ingest)             echo "Zerobus Ingest|Streaming ingestion" ;;
+        spark-python-data-source)              echo "Python Data Source|Custom Spark data sources" ;;
+        databricks-metric-views)               echo "Metric Views|Metric definitions" ;;
+        databricks-aibi-dashboards)            echo "AI/BI Dashboards|Dashboard creation" ;;
+        databricks-genie)                      echo "Genie|Natural language SQL" ;;
+        databricks-agent-bricks)               echo "Agent Bricks|Build AI agents" ;;
+        databricks-vector-search)              echo "Vector Search|Similarity search" ;;
+        databricks-model-serving)              echo "Model Serving|Deploy models/agents" ;;
+        databricks-mlflow-evaluation)          echo "MLflow Evaluation|Model evaluation" ;;
+        databricks-ai-functions)               echo "AI Functions|AI Functions, document parsing & RAG" ;;
+        databricks-unstructured-pdf-generation) echo "Unstructured PDF|Synthetic PDFs for RAG" ;;
+        databricks-synthetic-data-gen)         echo "Synthetic Data|Generate test data" ;;
+        databricks-lakebase)                   echo "Lakebase|Managed PostgreSQL (OLTP)" ;;
+        databricks-serverless-migration)       echo "Serverless Migration|Migrate to serverless compute" ;;
+        databricks-apps)                       echo "Apps|AppKit + all frameworks" ;;
+        databricks-apps-python)                echo "App (AppKit + Python)|AppKit, Dash, Streamlit, Flask" ;;
+        mlflow-onboarding)                     echo "MLflow Onboarding|Getting started" ;;
+        agent-evaluation)                      echo "Agent Evaluation|Evaluate AI agents" ;;
+        instrumenting-with-mlflow-tracing)     echo "MLflow Tracing|Instrument with tracing" ;;
+        analyze-mlflow-trace)                  echo "Analyze Traces|Analyze trace data" ;;
+        retrieving-mlflow-traces)              echo "Retrieve Traces|Search & retrieve traces" ;;
+        analyze-mlflow-chat-session)           echo "Analyze Chat Session|Chat session analysis" ;;
+        querying-mlflow-metrics)               echo "Query Metrics|MLflow metrics queries" ;;
+        searching-mlflow-docs)                 echo "Search MLflow Docs|MLflow documentation" ;;
+        *)                                     echo "$1|" ;;
+    esac
+}
+
+prompt_custom_skills() {
+    local preselected_profiles="$1"
+
+    # Build pre-selection set from any profiles that were also checked
+    # (core skills start pre-selected — they are recommended for every profile)
+    local preselected="$CORE_SKILLS"
+    for profile in $preselected_profiles; do
+        case $profile in
+            data-engineer) preselected="$preselected $PROFILE_DATA_ENGINEER" ;;
+            analyst)       preselected="$preselected $PROFILE_ANALYST" ;;
+            ai-ml-engineer) preselected="$preselected $PROFILE_AIML_ENGINEER $PROFILE_AIML_MLFLOW" ;;
+            app-developer) preselected="$preselected $PROFILE_APP_DEVELOPER" ;;
+        esac
+    done
+
+    echo ""
+    echo -e "  ${B}Select individual skills${N}"
+    echo -e "  ${D}Core skills (core, docs, python-sdk, unity-catalog) are recommended for all profiles${N}"
+
+    # Build the picker from the live inventory so new upstream skills appear
+    # automatically. Order: agent skills (stable, then experimental), then MLflow.
+    local -a items=()
+    local seen="" skill meta label hint state lock
+    for skill in $AGENT_B_STABLE $AGENT_B_EXPERIMENTAL $MLFLOW_SKILLS; do
+        _in_list "$skill" "$seen" && continue
+        seen="${seen:+$seen }$skill"
+        meta=$(_skill_meta "$skill")
+        label="${meta%%|*}"
+        hint="${meta#*|}"
+        state="off"; _in_list "$skill" "$preselected" && state="on"
+        # databricks-core is required — show it locked on (can't be deselected)
+        lock=""
+        if [ "$skill" = "databricks-core" ]; then
+            lock="lock"; hint="${hint:+$hint }(required)"
+        fi
+        items+=("${label}|${skill}|${state}|${hint}|${lock}")
+    done
+
+    local selected
+    selected=$(checkbox_select "${items[@]}")
+
+    # databricks-core is always required. This also guarantees a non-empty
+    # selection — otherwise USER_SKILLS would be empty and resolve_skills would
+    # fall back to installing ALL skills.
+    _in_list "databricks-core" "$selected" || selected="databricks-core${selected:+ $selected}"
+
+    # Warn if nothing beyond core was picked
+    local rest
+    rest=$(echo "$selected" | tr ' ' '\n' | sed '/^$/d' | grep -vx "databricks-core" || true)
+    [ -z "$rest" ] && warn "Only databricks-core selected — installing it alone (no other skills)"
+
+    # Use explicit skills list — set USER_SKILLS so resolve_skills handles it
+    USER_SKILLS=$(echo "$selected" | tr ' ' ',' | sed 's/^,//;s/,$//')
+}
+
+# Compare semantic versions (returns 0 if $1 >= $2)
+version_gte() {
+    printf '%s\n%s' "$2" "$1" | sort -V -C
+}
+
+# ─── Agent skills (databricks/databricks-agent-skills via `databricks aitools`) ───
+
+# Discover the live skill inventory from `databricks aitools list -o json`.
+# Falls back to the hardcoded snapshot when the CLI is missing/old/offline.
+# Idempotent — only fetches once.
+fetch_agent_b_inventory() {
+    [ -n "$AGENT_B_STABLE" ] && return
+
+    local json=""
+    if command -v databricks >/dev/null 2>&1; then
+        json=$(databricks aitools list -o json 2>/dev/null) || json=""
+    fi
+
+    if [ -n "$json" ]; then
+        AGENT_B_RELEASE=$(echo "$json" | grep -m1 '"release"' | sed -E 's/.*"release": *"([^"]*)".*/\1/')
+        # Pair each "name" with the "experimental" flag that follows it
+        local parsed
+        parsed=$(echo "$json" | awk '
+            /"name":/         { gsub(/[",]/, "", $2); name=$2 }
+            /"experimental":/ { gsub(/[",]/, "", $2); if (name != "") { print $2, name; name="" } }')
+        AGENT_B_STABLE=$(echo "$parsed" | awk '$1=="false"{print $2}' | tr '\n' ' ')
+        AGENT_B_EXPERIMENTAL=$(echo "$parsed" | awk '$1=="true"{print $2}' | tr '\n' ' ')
+    fi
+
+    if [ -z "$AGENT_B_STABLE" ]; then
+        AGENT_B_STABLE="$AGENT_B_STABLE_FALLBACK"
+        AGENT_B_EXPERIMENTAL="$AGENT_B_EXPERIMENTAL_FALLBACK"
+        AGENT_B_RELEASE=""
+    fi
+}
+
+# Gate for `databricks aitools` (ships with the Databricks CLI v1.0.0+).
+# Interactive: offers to run the upgrade and re-checks in a loop.
+# Silent/non-interactive: dies with instructions.
+# Returns 1 if the user chose to skip agent skills.
+ensure_aitools_cli() {
+    local attempts=0
+    while true; do
+        local cli_version=""
+        if command -v databricks >/dev/null 2>&1; then
+            cli_version=$(databricks --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        fi
+        if [ -n "$cli_version" ] && version_gte "$cli_version" "$MIN_AITOOLS_CLI_VERSION"; then
+            return 0
+        fi
+
+        local found_msg="Databricks CLI not found."
+        [ -n "$cli_version" ] && found_msg="Databricks CLI v${cli_version} is too old."
+
+        if [ "$SILENT" = true ] || ! is_interactive; then
+            die "$found_msg Agent skills are installed via 'databricks aitools', which requires Databricks CLI v${MIN_AITOOLS_CLI_VERSION}+.
+   Upgrade: ${B}curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh${N}
+   Then re-run this installer. (Or pass --skills with only non-agent skills to skip this requirement.)"
+        fi
+
+        attempts=$((attempts + 1))
+        if [ "$attempts" -gt 5 ]; then
+            warn "Databricks CLI still not at v${MIN_AITOOLS_CLI_VERSION}+ after several attempts — skipping agent skills"
+            return 1
+        fi
+
+        warn "$found_msg Agent skills are installed via ${B}databricks aitools${N}, which requires Databricks CLI v${MIN_AITOOLS_CLI_VERSION}+."
+        msg "Upgrade command: ${B}curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh${N}"
+        echo ""
+        local choice
+        choice=$(prompt "Upgrade the Databricks CLI now? ${D}(y = run upgrade, r = re-check, s = skip agent skills, a = abort)${N}" "y")
+        case "$choice" in
+            y|Y|yes)
+                curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh || warn "CLI upgrade failed — you can retry or skip"
+                hash -r 2>/dev/null || true
+                ;;
+            r|R) hash -r 2>/dev/null || true ;;
+            s|S) return 1 ;;
+            a|A) die "Installation aborted (Databricks CLI v${MIN_AITOOLS_CLI_VERSION}+ required for agent skills)" ;;
+        esac
+    done
+}
+
+# Map selected $TOOLS to `aitools --agents` tokens. Tools aitools doesn't
+# install for are handled by deliver_agent_skills (which links every selected
+# tool's dir from the canonical store).
+AITOOLS_AGENTS=""
+map_aitools_agents() {
+    AITOOLS_AGENTS=""
+    local tool
+    for tool in $TOOLS; do
+        case $tool in
+            claude)      AITOOLS_AGENTS="${AITOOLS_AGENTS:+$AITOOLS_AGENTS,}claude-code" ;;
+            cursor)      AITOOLS_AGENTS="${AITOOLS_AGENTS:+$AITOOLS_AGENTS,}cursor" ;;
+            copilot)     AITOOLS_AGENTS="${AITOOLS_AGENTS:+$AITOOLS_AGENTS,}copilot" ;;
+            codex)       AITOOLS_AGENTS="${AITOOLS_AGENTS:+$AITOOLS_AGENTS,}codex" ;;
+            opencode)    AITOOLS_AGENTS="${AITOOLS_AGENTS:+$AITOOLS_AGENTS,}opencode" ;;
+            antigravity) AITOOLS_AGENTS="${AITOOLS_AGENTS:+$AITOOLS_AGENTS,}antigravity" ;;
+        esac
+    done
+}
+
+# Skills dir for every selected tool (one per line, deduped). `aitools` only
+# fans out to some agents (e.g. project scope: just Claude Code + Cursor), so we
+# link the canonical store into every selected tool's dir ourselves.
+agent_skill_target_dirs() {
+    local base_dir=$1 tool
+    for tool in $TOOLS; do
+        case $tool in
+            claude)   echo "$base_dir/.claude/skills" ;;
+            cursor)   echo "$base_dir/.cursor/skills" ;;
+            copilot)  echo "$base_dir/.github/skills" ;;
+            codex)    echo "$base_dir/.agents/skills" ;;
+            gemini)   echo "$base_dir/.gemini/skills" ;;
+            antigravity) [ "$SCOPE" = "global" ] && echo "$HOME/.gemini/antigravity/skills" || echo "$base_dir/.agents/skills" ;;
+            windsurf) [ "$SCOPE" = "global" ] && echo "$HOME/.codeium/windsurf/skills" || echo "$base_dir/.windsurf/skills" ;;
+            opencode) [ "$SCOPE" = "global" ] && echo "$HOME/.config/opencode/skills" || echo "$base_dir/.opencode/skills" ;;
+            kiro)     [ "$SCOPE" = "global" ] && echo "$HOME/.kiro/skills" || echo "$base_dir/.kiro/skills" ;;
+        esac
+    done | sort -u
+}
+
+# True if any selected agent skill is experimental
+agent_b_needs_experimental() {
+    local skill
+    for skill in $SELECTED_AGENT_B_SKILLS; do
+        _in_list "$skill" "$AGENT_B_EXPERIMENTAL" && return 0
+    done
+    return 1
+}
+
+# Install agent skills by delegating to `databricks aitools install`.
+# aitools owns these skills afterwards (list/update/uninstall) — they are NOT
+# tracked in this installer's manifest, except for the symlinks/copies created
+# for tools aitools can't target.
+install_agent_b_skills() {
+    local base_dir=$1
+    local prev_file="$STATE_DIR/.agent-b-skills"
+    [ -z "$SELECTED_AGENT_B_SKILLS" ] && [ ! -f "$prev_file" ] && return
+
+    step "Installing agent skills (via databricks aitools)"
+
+    # Uninstall agent skills dropped since the previous run
+    if [ -f "$prev_file" ]; then
+        local dropped="" skill
+        for skill in $(cat "$prev_file"); do
+            _in_list "$skill" "$SELECTED_AGENT_B_SKILLS" || dropped="${dropped:+$dropped,}$skill"
+        done
+        if [ -n "$dropped" ] && command -v databricks >/dev/null 2>&1; then
+            if databricks aitools uninstall --scope "$SCOPE" --skills "$dropped" >/dev/null 2>&1; then
+                msg "${D}Removed deselected agent skills: ${dropped}${N}"
+            else
+                warn "Could not remove deselected agent skills — run: ${B}databricks aitools uninstall --skills $dropped${N}"
+            fi
+        fi
+    fi
+
+    if [ -z "$SELECTED_AGENT_B_SKILLS" ]; then
+        rm -f "$prev_file"
+        return
+    fi
+
+    if ! ensure_aitools_cli; then
+        warn "Agent skills skipped — install later with: ${B}databricks aitools install${N}"
+        return
+    fi
+
+    map_aitools_agents
+
+    # "All" path: skip the fragile per-skill enumeration and let the native
+    # `databricks aitools install` define the full set itself (its default = every
+    # stable skill; --experimental adds the rest). This installs the plugin for
+    # agents that support it (Claude Code / Codex / Copilot) and raw files for the
+    # others, exactly as the CLI intends. Tools aitools can't target
+    # (Gemini/Windsurf/Kiro) are still mirrored the same set.
+    if [ "$SELECTED_ALL_AGENT_B" = true ]; then
+        install_agent_b_all "$base_dir"
+        mkdir -p "$STATE_DIR"
+        echo "$SELECTED_AGENT_B_SKILLS" | tr ' ' '\n' | sed '/^$/d' > "$prev_file"
+        return
+    fi
+
+    # We always install a named subset via --skills, which the CLI only allows
+    # with --skills-only (or --path): the default plugin install is all-or-nothing.
+    # --skills-only writes raw skill files and the .databricks/aitools/skills store
+    # that deliver_agent_skills mirrors into every other selected tool.
+    local skills_csv exp_flag=""
+    skills_csv=$(echo "$SELECTED_AGENT_B_SKILLS" | tr -s ' ' ',' | sed 's/^,//;s/,$//')
+    agent_b_needs_experimental && exp_flag="--experimental"
+    local count
+    count=$(_count $SELECTED_AGENT_B_SKILLS)
+
+    if [ -n "$AITOOLS_AGENTS" ]; then
+        msg "Delegating ${B}${count}${N} agent skills to ${B}databricks aitools${N} (agents: ${AITOOLS_AGENTS})"
+        # Capture so we can drop aitools' "Skipped <agent>: does not support
+        # project-scoped skills" notices — deliver_agent_skills below covers
+        # those agents itself, so that alone isn't a real failure.
+        local aitools_out aitools_rc aitools_residual
+        aitools_out=$(databricks aitools install --scope "$SCOPE" --agents "$AITOOLS_AGENTS" --skills "$skills_csv" --skills-only $exp_flag -p "$PROFILE" 2>&1) && aitools_rc=0 || aitools_rc=$?
+        aitools_residual=$(echo "$aitools_out" | grep -v 'does not support project-scoped skills' || true)
+        if [ "$SILENT" != true ] && [ -n "$aitools_residual" ]; then
+            echo "$aitools_residual"
+        fi
+        if [ "$aitools_rc" -ne 0 ] && echo "$aitools_residual" | grep -q '^Error:'; then
+            [ "$SILENT" = true ] && die "databricks aitools install failed"
+            warn "databricks aitools install failed — agent skills not installed"
+            return
+        fi
+        ok "Agent skills ($count) installed — manage with ${B}databricks aitools list|update|uninstall${N}"
+    fi
+
+    # aitools only installs for some agents (project scope: just Claude Code +
+    # Cursor). Link the canonical store into every other selected tool's dir.
+    deliver_agent_skills "$base_dir" "$skills_csv" "$exp_flag"
+
+    # Record the selection so a future profile change can uninstall dropped skills
+    mkdir -p "$STATE_DIR"
+    echo "$SELECTED_AGENT_B_SKILLS" | tr ' ' '\n' | sed '/^$/d' > "$prev_file"
+}
+
+# Plugin-capable agents: `databricks aitools install` registers a marketplace
+# plugin for these instead of writing raw skill files, so their skills dir stays
+# empty. When the plugin install succeeds we must NOT also mirror raw files into
+# that dir (it would double-install every skill). Map each to the skills dir it
+# would otherwise use, so we can exclude it from the mirror.
+#   claude-code → .claude/skills   codex → .agents/skills   copilot → .github/skills
+plugin_agent_skills_dir() {
+    local base_dir=$1 tool=$2
+    case $tool in
+        claude)  echo "$base_dir/.claude/skills" ;;
+        codex)   echo "$base_dir/.agents/skills" ;;
+        copilot) echo "$base_dir/.github/skills" ;;
+    esac
+}
+
+# Print a "did NOT install" failure block and abort. $1 = the stage that failed,
+# $2 = the exact command that was tried, $3 = short guidance on what to fix.
+# Stops the whole installer (non-zero) so it's unambiguous nothing was installed —
+# the user fixes the marketplace, then re-runs this installer.
+die_plugin_setup() {
+    local stage=$1 cmd=$2 fix=$3
+    echo "" >&2
+    echo -e "  ${R}✗ Install stopped — ${stage} failed. Agent skills were NOT installed.${N}" >&2
+    echo -e "  ${D}Command tried:${N}" >&2
+    echo -e "    ${B}${cmd}${N}" >&2
+    echo -e "  ${D}${fix}${N}" >&2
+    echo -e "  ${D}Once that succeeds, re-run this installer to finish.${N}" >&2
+    exit 1
+}
+
+# Ensure Claude Code's official plugin marketplace is present and fresh before the
+# native aitools install runs `claude plugin install databricks@claude-plugins-official`.
+# aitools only runs `marketplace update` (refresh), never `marketplace add`, so it
+# assumes the marketplace is already registered — which fails on installs where it
+# isn't (older/removed). We add it if missing, or update it if stale. A failure here
+# means the plugin install downstream cannot succeed, so we stop with clear guidance
+# rather than let it fail vaguely later.
+ensure_claude_marketplace() {
+    # Only relevant when Claude Code is a selected tool (it's the plugin agent we own).
+    _in_list "claude" "$TOOLS" || return 0
+    command -v claude >/dev/null 2>&1 || return 0  # no Claude CLI — aitools handles the miss
+
+    local mp="claude-plugins-official"
+    local present=""
+    # `marketplace list --json` is stable; fall back to plain text if --json is unsupported.
+    # `|| true` keeps a no-match grep (exit 1) from tripping `set -e` when the
+    # marketplace is legitimately absent — that's the ADD case, not an error.
+    present=$(claude plugin marketplace list --json 2>/dev/null | grep -o "\"name\"[[:space:]]*:[[:space:]]*\"${mp}\"" | head -1 || true)
+    [ -z "$present" ] && present=$(claude plugin marketplace list 2>/dev/null | grep -F "$mp" || true) || true
+
+    if [ -z "$present" ]; then
+        msg "Adding Claude Code plugin marketplace (${B}${mp}${N})"
+        if ! claude plugin marketplace add anthropics/claude-plugins-official >/dev/null 2>&1; then
+            die_plugin_setup \
+                "adding the Claude plugin marketplace" \
+                "claude plugin marketplace add anthropics/claude-plugins-official" \
+                "Run that command yourself and confirm it succeeds (it needs a working 'claude' CLI)."
+        fi
+    else
+        # Present but possibly stale — refresh so the databricks plugin resolves.
+        if ! claude plugin marketplace update "$mp" >/dev/null 2>&1; then
+            die_plugin_setup \
+                "refreshing the Claude plugin marketplace" \
+                "claude plugin marketplace update ${mp}" \
+                "Run that command yourself and confirm it succeeds (it needs a working 'claude' CLI)."
+        fi
+    fi
+}
+
+# Verify the databricks plugin actually landed for Claude Code after the aitools
+# install. aitools can report success while the underlying `claude plugin install`
+# silently no-ops (e.g. a wrapped/older CLI), so we confirm the plugin is registered
+# and stop with clear guidance if it isn't — otherwise the user thinks it installed.
+verify_claude_plugin() {
+    _in_list "claude" "$TOOLS" || return 0
+    command -v claude >/dev/null 2>&1 || return 0  # can't verify without the CLI; don't block
+
+    local id="databricks@claude-plugins-official"
+    local found=""
+    # `|| true` so a no-match grep (exit 1) doesn't trip `set -e` before we get to
+    # the explicit "not registered" check below.
+    found=$(claude plugin list --json 2>/dev/null | grep -o "\"id\"[[:space:]]*:[[:space:]]*\"${id}\"" | head -1 || true)
+    [ -z "$found" ] && found=$(claude plugin list 2>/dev/null | grep -F "$id" || true) || true
+
+    if [ -z "$found" ]; then
+        # The `claude` CLI only accepts user|project|local scopes
+        local claude_scope
+        [ "$SCOPE" = "project" ] && claude_scope="project" || claude_scope="user"
+        die_plugin_setup \
+            "installing the Claude plugin (${id})" \
+            "claude plugin install ${id} --scope ${claude_scope}" \
+            "databricks aitools reported success but the plugin is not registered — run that command yourself and confirm it succeeds (it needs a working 'claude' CLI)."
+    fi
+}
+
+# "All skills" install: delegate to the native `databricks aitools install` with
+# no --skills list, so the CLI installs its full default set (plus experimental
+# when enabled). Unlike the enumerated path this uses the agents' native install
+# (marketplace plugin for Claude Code / Codex / Copilot; raw files for the rest),
+# then mirrors the same full set into every tool the native install did NOT cover.
+install_agent_b_all() {
+    local base_dir=$1
+
+    # Experimental skills are part of "all" unless the user opted out.
+    local exp_flag=""
+    [ "$INSTALL_EXPERIMENTAL" = true ] && exp_flag="--experimental"
+
+    # Skills dirs owned by a plugin — filled by the plugin, not by us. Any plugin
+    # agent whose install is refused in this scope (project-scope Codex/Copilot)
+    # is left out, so the mirror below still covers it (matching prior coverage).
+    local plugin_dirs=""
+
+    if [ -n "$AITOOLS_AGENTS" ]; then
+        # Make sure Claude Code's official marketplace is registered/fresh so the
+        # native plugin install below can resolve databricks@claude-plugins-official.
+        ensure_claude_marketplace
+        msg "Installing ${B}all${N} agent skills via ${B}databricks aitools${N} (agents: ${AITOOLS_AGENTS})"
+        # Drop the "Skipped <agent>: ... project scope" / "user-only" notices that
+        # aitools prints for agents it can't target in this scope — the mirror below
+        # covers those tools, so those alone aren't real failures.
+        local aitools_out aitools_rc aitools_residual
+        aitools_out=$(databricks aitools install --scope "$SCOPE" --agents "$AITOOLS_AGENTS" $exp_flag -p "$PROFILE" 2>&1) && aitools_rc=0 || aitools_rc=$?
+        aitools_residual=$(echo "$aitools_out" | grep -vE 'does not support project-scoped skills|is user-only; project scope is not supported' || true)
+        if [ "$SILENT" != true ] && [ -n "$aitools_residual" ]; then
+            echo "$aitools_residual"
+        fi
+        if [ "$aitools_rc" -ne 0 ] && echo "$aitools_residual" | grep -q '^Error:'; then
+            [ "$SILENT" = true ] && die "databricks aitools install failed"
+            warn "databricks aitools install failed — agent skills not installed"
+            return
+        fi
+        ok "Agent skills (all) installed — manage with ${B}databricks aitools list|update|uninstall${N}"
+
+        # A plugin agent counts as plugin-owned only if it wasn't skipped/refused.
+        local tool disp
+        for tool in $TOOLS; do
+            case $tool in
+                claude)  disp="Claude Code" ;;
+                codex)   disp="Codex CLI" ;;
+                copilot) disp="GitHub Copilot" ;;
+                *)       continue ;;
+            esac
+            if ! echo "$aitools_out" | grep -q "Skipped ${disp}:"; then
+                plugin_dirs="${plugin_dirs:+$plugin_dirs
+}$(plugin_agent_skills_dir "$base_dir" "$tool")"
+            fi
+        done
+
+        # Confirm the Claude plugin actually registered (unless aitools skipped it
+        # for this scope). Catches wrappers/older CLIs where the plugin install
+        # silently no-ops even though aitools reported success.
+        if ! echo "$aitools_out" | grep -q "Skipped Claude Code:"; then
+            verify_claude_plugin
+        fi
+    fi
+
+    # Mirror the full set into every selected tool's skills dir that the native
+    # install did NOT cover (plugin-owned dirs are excluded). Files come from a
+    # throwaway --path staging so the set matches what the CLI just installed.
+    deliver_agent_b_all "$base_dir" "$exp_flag" "$plugin_dirs"
+}
+
+# Stage the full "all" skill set to a temp dir via `aitools install --path` and
+# copy real skill files into every selected tool's skills dir that the native
+# install didn't already populate. Plugin-owned dirs ($plugin_dirs, newline-
+# separated) are skipped so plugin agents aren't double-installed. Uses the CLI's
+# own resolved set as the source of truth so every tool gets the identical skills.
+deliver_agent_b_all() {
+    local base_dir=$1 exp_flag=$2 plugin_dirs=$3
+    local manifest="$STATE_DIR/.installed-skills"
+
+    local tmp_dir store
+    tmp_dir=$(mktemp -d)
+    if ! databricks aitools install --path "$tmp_dir" $exp_flag >/dev/null 2>&1; then
+        rm -rf "$tmp_dir"
+        warn "Could not stage agent skills for: $(echo "$TOOLS" | tr ' ' ',')"
+        return
+    fi
+    store="$tmp_dir"
+
+    # The full set the CLI resolved (real skill dirs only, no dotfiles).
+    local all_skills=""
+    local d
+    for d in "$store"/*/; do
+        [ -d "$d" ] || continue
+        all_skills="${all_skills:+$all_skills }$(basename "$d")"
+    done
+
+    local dir skill made
+    while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
+        # Skip dirs a plugin owns — the plugin serves those agents, so raw copies
+        # here would double-install every skill.
+        if [ -n "$plugin_dirs" ] && printf '%s\n' "$plugin_dirs" | grep -Fxq "$dir"; then
+            continue
+        fi
+        mkdir -p "$dir"
+        made=0
+        for skill in $all_skills; do
+            # Leave anything the native install already placed (real dir or symlink)
+            # to aitools — it owns and updates those.
+            if [ -e "$dir/$skill" ] || [ -L "$dir/$skill" ]; then
+                continue
+            fi
+            cp -R "$store/$skill" "$dir/$skill"
+            echo "$dir|$skill" >> "$manifest"
+            made=$((made + 1))
+        done
+        [ "$made" -gt 0 ] && ok "Agent skills ($made, copy) → ${dir#$HOME/}"
+    done < <(agent_skill_target_dirs "$base_dir")
+
+    rm -rf "$tmp_dir"
+    return 0
+}
+
+# Link the agent skills into every selected tool's skills dir from the canonical
+# store, so tools aitools doesn't install for (project scope: everything except
+# Claude Code + Cursor; plus Gemini/Windsurf/Kiro, which aitools never targets)
+# still get the skills. Entries aitools already created are left to aitools.
+# If no aitools-supported agent was selected there is no persistent store, so we
+# stage a throwaway install in a temp dir and copy real files from it.
+deliver_agent_skills() {
+    local base_dir=$1 skills_csv=$2 exp_flag=$3
+    local manifest="$STATE_DIR/.installed-skills"
+
+    local mode="link" store tmp_dir=""
+    if [ "$SCOPE" = "global" ]; then
+        store="$HOME/.databricks/aitools/skills"
+    else
+        store="$base_dir/.databricks/aitools/skills"
+    fi
+
+    if [ -z "$AITOOLS_AGENTS" ]; then
+        mode="copy"
+        tmp_dir=$(mktemp -d)
+        if ! (cd "$tmp_dir" && databricks aitools install --scope project --agents claude-code --skills "$skills_csv" --skills-only $exp_flag >/dev/null 2>&1); then
+            rm -rf "$tmp_dir"
+            warn "Could not stage agent skills for: $(echo "$TOOLS" | tr ' ' ',')"
+            return
+        fi
+        store="$tmp_dir/.databricks/aitools/skills"
+    fi
+
+    local dir skill target made
+    while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
+        mkdir -p "$dir"
+        made=0
+        for skill in $SELECTED_AGENT_B_SKILLS; do
+            if [ ! -d "$store/$skill" ]; then
+                warn "Agent skill '$skill' missing from aitools store — skipped"
+                continue
+            fi
+            # In link mode, leave anything aitools already placed (e.g. Claude
+            # Code / Cursor) to aitools — it owns and updates those.
+            if [ "$mode" = "link" ] && { [ -e "$dir/$skill" ] || [ -L "$dir/$skill" ]; }; then
+                continue
+            fi
+            rm -rf "$dir/$skill"
+            if [ "$mode" = "link" ]; then
+                # Project-scope dirs are all <base>/.<tool>/skills (2 levels deep),
+                # so a relative link survives moving the project directory.
+                target="$store/$skill"
+                [ "$SCOPE" = "project" ] && target="../../.databricks/aitools/skills/$skill"
+                ln -s "$target" "$dir/$skill"
+            else
+                cp -R "$store/$skill" "$dir/$skill"
+            fi
+            echo "$dir|$skill" >> "$manifest"
+            made=$((made + 1))
+        done
+        [ "$made" -gt 0 ] && ok "Agent skills ($made, $mode) → ${dir#$HOME/}"
+    done < <(agent_skill_target_dirs "$base_dir")
+
+    [ -n "$tmp_dir" ] && rm -rf "$tmp_dir"
+    return 0
+}
+
+# ─── Raw-fetch ref resolution (mlflow) ───────────────────────
+
+# resolve_ref <owner/repo> <requested>
+#   ""/"latest" → highest stable semver tag (prereleases excluded unless
+#                 INCLUDE_PRERELEASES=1; falls back to main if no tags).
+#   main/master → passed through.
+#   anything else → verified to exist as a tag/branch/SHA (fails loud).
+# Uses `git ls-remote` (no API rate limits; git is a hard prerequisite) and
+# `sort -V` (GNU coreutils; available in macOS bash environments).
+resolve_ref() {
+    local repo=$1 requested=$2
+    local git_url="https://github.com/${repo}.git"
+    case "$requested" in
+        ""|latest)
+            local tags pattern best
+            tags=$(git ls-remote --tags --refs "$git_url" 2>/dev/null | sed 's|.*refs/tags/||')
+            pattern='^v?[0-9]+\.[0-9]+\.[0-9]+$'
+            [ "$INCLUDE_PRERELEASES" = "1" ] && pattern='^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'
+            best=$(echo "$tags" | grep -E "$pattern" | sort -V | tail -1)
+            if [ -n "$best" ]; then
+                echo "$best"
+            else
+                warn "Could not resolve latest tag for ${repo} — falling back to main" >&2
+                echo "main"
+            fi
+            ;;
+        main|master)
+            echo "$requested"
+            ;;
+        *)
+            if git ls-remote "$git_url" "refs/tags/${requested}" "refs/heads/${requested}" 2>/dev/null | grep -q .; then
+                echo "$requested"
+            elif curl -fsSL -o /dev/null "https://api.github.com/repos/${repo}/commits/${requested}" 2>/dev/null; then
+                echo "$requested"  # bare commit SHA (not addressable via ls-remote)
+            else
+                die "Ref '${requested}' not found in ${repo}"
+            fi
+            ;;
+    esac
+}
+
+# Resolve refs for all selected raw-fetch sources (records globals for the
+# fetch URLs, summary, dry run, and lockfile)
+MLFLOW_RESOLVED_REF=""
+resolve_fetch_refs() {
+    [ -n "$SELECTED_MLFLOW_SKILLS" ] && MLFLOW_RESOLVED_REF=$(resolve_ref "mlflow/skills" "$MLFLOW_REF")
+    return 0
+}
+
+# Best-effort commit SHA for a ref (empty on failure). Prefers the peeled
+# tag object (^{}) so annotated tags resolve to the commit they point at.
+github_sha() {
+    local out sha
+    out=$(git ls-remote "https://github.com/$1.git" "refs/tags/$2^{}" "refs/tags/$2" "refs/heads/$2" 2>/dev/null)
+    sha=$(echo "$out" | grep '\^{}' | head -1 | cut -f1)
+    [ -z "$sha" ] && sha=$(echo "$out" | head -1 | cut -f1)
+    if [ -z "$sha" ]; then
+        sha=$(curl -fsSL "https://api.github.com/repos/$1/commits/$2" 2>/dev/null \
+            | grep -m1 '"sha":' | sed -E 's/.*"sha": *"([^"]+)".*/\1/')
+    fi
+    echo "$sha"
+}
+
+# Record what was installed and from where (skills.lock in the scope-local state dir)
+write_lockfile() {
+    local lock="$STATE_DIR/skills.lock"
+    mkdir -p "$STATE_DIR"
+    local now entries="" sha kind
+    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    if [ -n "$SELECTED_MLFLOW_SKILLS" ]; then
+        sha=$(github_sha "mlflow/skills" "$MLFLOW_RESOLVED_REF")
+        entries="    \"mlflow/skills\": {\"requested_ref\": \"${MLFLOW_REF}\", \"resolved_kind\": \"branch\", \"resolved_ref\": \"${MLFLOW_RESOLVED_REF}\", \"resolved_sha\": \"${sha}\", \"fetched_at\": \"${now}\"}"
+    fi
+    if [ -n "$SELECTED_AGENT_B_SKILLS" ]; then
+        local cli_version
+        cli_version=$(databricks --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        entries="${entries:+$entries,
+}    \"databricks/databricks-agent-skills\": {\"install_method\": \"databricks-aitools\", \"cli_version\": \"${cli_version}\", \"skills_release\": \"${AGENT_B_RELEASE}\", \"fetched_at\": \"${now}\"}"
+    fi
+
+    [ -z "$entries" ] && return 0
+    printf '{\n  "sources": {\n%s\n  }\n}\n' "$entries" > "$lock"
+}
+
+# ─── Dry run ──────────────────────────────────────────────────
+dry_run_report() {
+    map_aitools_agents
+    echo ""
+    echo -e "${B}Dry run — nothing was installed${N}"
+    echo "────────────────────────────────"
+    msg "MLflow skills @ ${MLFLOW_RESOLVED_REF:-n/a}: ${SELECTED_MLFLOW_SKILLS:-<none>}"
+    if [ "$SELECTED_ALL_AGENT_B" = true ]; then
+        # "All" path: native install (plugin for Claude/Codex/Copilot, raw files
+        # for the rest) with no --skills list; --experimental unless opted out.
+        local exp_flag=""
+        [ "$INSTALL_EXPERIMENTAL" = true ] && exp_flag=" --experimental"
+        msg "Agent skills (databricks-agent-skills${AGENT_B_RELEASE:+ @ $AGENT_B_RELEASE}): ${B}all${N}"
+        if [ -n "$AITOOLS_AGENTS" ]; then
+            msg "Would run: ${B}databricks aitools install --scope ${SCOPE} --agents ${AITOOLS_AGENTS}${exp_flag} -p ${PROFILE}${N}"
+        fi
+        msg "Would mirror the full set (copy from a temp-dir 'aitools install --path') into every selected tool the native install didn't cover; plugin-owned dirs are left to the plugin:"
+        local dir base_dir
+        [ "$SCOPE" = "global" ] && base_dir="$HOME" || base_dir="$(pwd)"
+        while IFS= read -r dir; do
+            [ -n "$dir" ] && msg "  → $dir"
+        done < <(agent_skill_target_dirs "$base_dir")
+    elif [ -n "$SELECTED_AGENT_B_SKILLS" ]; then
+        local skills_csv exp_flag=""
+        skills_csv=$(echo "$SELECTED_AGENT_B_SKILLS" | tr -s ' ' ',' | sed 's/^,//;s/,$//')
+        agent_b_needs_experimental && exp_flag=" --experimental"
+        msg "Agent skills (databricks-agent-skills${AGENT_B_RELEASE:+ @ $AGENT_B_RELEASE}): ${SELECTED_AGENT_B_SKILLS}"
+        if [ -n "$AITOOLS_AGENTS" ]; then
+            msg "Would run: ${B}databricks aitools install --scope ${SCOPE} --agents ${AITOOLS_AGENTS} --skills ${skills_csv} --skills-only${exp_flag} -p ${PROFILE}${N}"
+        fi
+        local mode="symlink from the aitools canonical store"
+        [ -z "$AITOOLS_AGENTS" ] && mode="copy via a temp-dir aitools install"
+        msg "Would deliver agent skills to every selected tool ($mode); entries aitools creates are left to aitools:"
+        local dir base_dir
+        [ "$SCOPE" = "global" ] && base_dir="$HOME" || base_dir="$(pwd)"
+        while IFS= read -r dir; do
+            [ -n "$dir" ] && msg "  → $dir"
+        done < <(agent_skill_target_dirs "$base_dir")
+    else
+        msg "Agent skills: <none>"
+    fi
+    echo ""
+}
+
+# Check Databricks CLI version meets minimum requirement
+check_cli_version() {
+    local cli_version
+    cli_version=$(databricks --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+    if [ -z "$cli_version" ]; then
+        warn "Could not determine Databricks CLI version"
+        return
+    fi
+
+    if version_gte "$cli_version" "$MIN_CLI_VERSION"; then
+        ok "Databricks CLI v${cli_version}"
+    else
+        warn "Databricks CLI v${cli_version} is outdated (minimum: v${MIN_CLI_VERSION})"
+        msg "  ${B}Upgrade:${N} curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh"
+    fi
+}
+
+# Check prerequisites
+check_deps() {
+    command -v git >/dev/null 2>&1 || die "git required"
+    ok "git"
+
+    if command -v databricks >/dev/null 2>&1; then
+        check_cli_version
+    else
+        warn "Databricks CLI not found. Install: ${B}curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh${N}"
+        msg "${D}You can still install, but authentication will require the CLI later.${N}"
+    fi
+}
+
+# Check if update needed
+check_version() {
+    local ver_file="$INSTALL_DIR/version"
+    [ "$SCOPE" = "project" ] && ver_file=".ai-dev-kit/version"
+    
+    [ ! -f "$ver_file" ] && return
+    [ "$FORCE" = true ] && return
+
+    # Skip version gate if user explicitly wants a different skill profile
+    if [ -n "$SKILLS_PROFILE" ] || [ -n "$USER_SKILLS" ]; then
+        local saved_profile_file="$STATE_DIR/.skills-profile"
+        [ ! -f "$saved_profile_file" ] && [ "$SCOPE" = "project" ] && saved_profile_file="$INSTALL_DIR/.skills-profile"
+        if [ -f "$saved_profile_file" ]; then
+            local saved_profile
+            saved_profile=$(cat "$saved_profile_file")
+            local requested="${USER_SKILLS:+custom:$USER_SKILLS}"
+            [ -z "$requested" ] && requested="$SKILLS_PROFILE"
+            [ "$saved_profile" != "$requested" ] && return
+        fi
+    fi
+
+    local local_ver=$(cat "$ver_file")
+    # Use -f to fail on HTTP errors (like 404)
+    local remote_ver=$(curl -fsSL "$RAW_URL/VERSION" 2>/dev/null || echo "")
+
+    # Validate remote version format (should not contain "404" or other error text)
+    if [ -n "$remote_ver" ] && [[ ! "$remote_ver" =~ (404|Not Found|error) ]]; then
+        if [ "$local_ver" = "$remote_ver" ]; then
+            ok "Already up to date (v${local_ver})"
+            msg "${D}Use --force to reinstall or --skills-profile to change profiles${N}"
+            exit 0
+        fi
+    fi
+}
+
+# Install skills
+install_skills() {
+    step "Installing skills"
+
+    local base_dir=$1
+    local dirs=()
+
+    # Determine target directories (array so paths with spaces work)
+    for tool in $TOOLS; do
+        case $tool in
+            claude) dirs+=("$base_dir/.claude/skills") ;;
+            cursor) dirs+=("$base_dir/.cursor/skills") ;;
+            copilot) dirs+=("$base_dir/.github/skills") ;;
+            codex) dirs+=("$base_dir/.agents/skills") ;;
+            gemini) dirs+=("$base_dir/.gemini/skills") ;;
+            antigravity)
+                if [ "$SCOPE" = "global" ]; then
+                    dirs+=("$HOME/.gemini/antigravity/skills")
+                else
+                    dirs+=("$base_dir/.agents/skills")
+                fi
+                ;;
+            windsurf)
+                if [ "$SCOPE" = "global" ]; then
+                    dirs+=("$HOME/.codeium/windsurf/skills")
+                else
+                    dirs+=("$base_dir/.windsurf/skills")
+                fi
+                ;;
+            opencode)
+                if [ "$SCOPE" = "global" ]; then
+                    dirs+=("$HOME/.config/opencode/skills")
+                else
+                    dirs+=("$base_dir/.opencode/skills")
+                fi
+                ;;
+            kiro)
+                if [ "$SCOPE" = "global" ]; then
+                    dirs+=("$HOME/.kiro/skills")
+                else
+                    dirs+=("$base_dir/.kiro/skills")
+                fi
+                ;;
+        esac
+    done
+
+    # Dedupe: one element per line, sort -u, read back into array
+    local unique=()
+    while IFS= read -r d; do
+        unique+=("$d")
+    done < <(printf '%s\n' "${dirs[@]}" | sort -u)
+    dirs=("${unique[@]}")
+
+    # Count selected skills for display
+    local mlflow_count
+    mlflow_count=$(_count $SELECTED_MLFLOW_SKILLS)
+    msg "Installing ${B}${mlflow_count}${N} MLflow skills (Databricks skills are installed separately via databricks aitools)"
+
+    # Skills this installer manages directly (MLflow). Agent skills are
+    # deliberately NOT in this set: any same-named entry from an older install is
+    # a stale real copy that must be removed — `databricks aitools` will not
+    # overwrite an existing real directory, so leaving it would shadow the new
+    # install. (Symlinks for tools aitools can't target are re-created each run.)
+    local all_new_skills="$SELECTED_MLFLOW_SKILLS"
+
+    # Clean up previously installed skills that are no longer managed here
+    # Check scope-local manifest first, fall back to global for upgrades from older versions
+    local manifest="$STATE_DIR/.installed-skills"
+    [ ! -f "$manifest" ] && [ "$SCOPE" = "project" ] && [ -f "$INSTALL_DIR/.installed-skills" ] && manifest="$INSTALL_DIR/.installed-skills"
+    if [ -f "$manifest" ]; then
+        while IFS='|' read -r prev_dir prev_skill; do
+            [ -z "$prev_skill" ] && continue
+            # Skip if this skill is still selected (exact match — see _in_list for why)
+            if _in_list "$prev_skill" "$all_new_skills"; then
+                continue
+            fi
+            # Remove real dirs and symlinks alike (rm -rf on a symlink removes the link)
+            if [ -d "$prev_dir/$prev_skill" ] || [ -L "$prev_dir/$prev_skill" ]; then
+                rm -rf "$prev_dir/$prev_skill"
+                msg "${D}Removed previously installed skill: $prev_skill${N}"
+            fi
+        done < "$manifest"
+    fi
+
+    # Start fresh manifest (always write to scope-local state dir)
+    manifest="$STATE_DIR/.installed-skills"
+    mkdir -p "$STATE_DIR"
+    : > "$manifest.tmp"
+
+    local mlflow_raw_url="$MLFLOW_BASE_URL/${MLFLOW_RESOLVED_REF:-main}"
+
+    for dir in "${dirs[@]}"; do
+        mkdir -p "$dir"
+        # Install MLflow skills from mlflow/skills repo
+        if [ -n "$SELECTED_MLFLOW_SKILLS" ]; then
+            for skill in $SELECTED_MLFLOW_SKILLS; do
+                local dest_dir="$dir/$skill"
+                mkdir -p "$dest_dir"
+                local url="$mlflow_raw_url/$skill/SKILL.md"
+                if curl -fsSL "$url" -o "$dest_dir/SKILL.md" 2>/dev/null; then
+                    # Try to fetch optional reference files
+                    for ref in reference.md examples.md api.md; do
+                        curl -fsSL "$mlflow_raw_url/$skill/$ref" -o "$dest_dir/$ref" 2>/dev/null || true
+                    done
+                    echo "$dir|$skill" >> "$manifest.tmp"
+                else
+                    rm -rf "$dest_dir"
+                fi
+            done
+            ok "MLflow skills ($mlflow_count, @ ${MLFLOW_RESOLVED_REF}) → ${dir#$HOME/}"
+        fi
+    done
+
+    # Save manifest of installed skills (for cleanup on profile change)
+    mv "$manifest.tmp" "$manifest"
+
+    # Save selected profile for future reinstalls (scope-local)
+    if [ -n "$USER_SKILLS" ]; then
+        echo "custom:$USER_SKILLS" > "$STATE_DIR/.skills-profile"
+    else
+        echo "${SKILLS_PROFILE:-all}" > "$STATE_DIR/.skills-profile"
+    fi
+}
+
+write_gemini_md() {
+    local path=$1
+    [ -f "$path" ] && return  # Don't overwrite existing file
+    cat > "$path" << 'GEMINIEOF'
+# Databricks AI Dev Kit
+
+You have access to Databricks skills installed by the Databricks AI Dev Kit.
+
+## Available Skills
+
+Skills are installed in `.gemini/skills/` and provide patterns and best practices for:
+- Spark Declarative Pipelines, Structured Streaming
+- Databricks Jobs, Asset Bundles
+- Unity Catalog, SQL, Genie
+- MLflow evaluation and tracing
+- Model Serving, Vector Search
+- Databricks Apps
+- And more
+
+## Getting Started
+
+Try asking: "List my SQL warehouses" or "Show my Unity Catalog schemas"
+GEMINIEOF
+    ok "GEMINI.md"
+}
+
+# Save version
+save_version() {
+    # Use -f to fail on HTTP errors (like 404)
+    local ver=$(curl -fsSL "$RAW_URL/VERSION" 2>/dev/null || echo "dev")
+    # Validate version format
+    [[ "$ver" =~ (404|Not Found|error) ]] && ver="dev"
+    # Ensure the state dir exists before writing the version file.
+    mkdir -p "$INSTALL_DIR"
+    echo "$ver" > "$INSTALL_DIR/version"
+    if [ "$SCOPE" = "project" ]; then
+        mkdir -p ".ai-dev-kit"
+        echo "$ver" > ".ai-dev-kit/version"
+    fi
+}
+
+# Print summary
+summary() {
+    if [ "$SILENT" = false ]; then
+        echo ""
+        echo -e "${G}${B}Installation complete!${N}"
+        echo "────────────────────────────────"
+        msg "Location: $INSTALL_DIR"
+        msg "Scope:    $SCOPE"
+        msg "Tools:    $(echo "$TOOLS" | tr ' ' ', ')"
+        if [ -n "$SELECTED_AGENT_B_SKILLS" ]; then
+            msg "Agent skills are managed by ${B}databricks aitools${N} — update with ${B}databricks aitools update${N}"
+        fi
+        echo ""
+        msg "${B}Next steps:${N}"
+        local step=1
+        if echo "$TOOLS" | grep -q copilot; then
+            msg "${step}. Use Copilot in ${B}Agent mode${N} to access Databricks skills"
+            step=$((step + 1))
+        fi
+        if echo "$TOOLS" | grep -q gemini; then
+            msg "${step}. Launch Gemini CLI in your project: ${B}gemini${N}"
+            step=$((step + 1))
+        fi
+        if echo "$TOOLS" | grep -q antigravity; then
+            msg "${step}. Open your project in Antigravity to use Databricks skills"
+            step=$((step + 1))
+        fi
+        if echo "$TOOLS" | grep -q opencode; then
+            msg "${step}. Launch OpenCode in your project: ${B}opencode${N}"
+            step=$((step + 1))
+        fi
+        if echo "$TOOLS" | grep -q kiro; then
+            msg "${step}. Open your project in Kiro to use Databricks skills"
+            step=$((step + 1))
+        fi
+        msg "${step}. Open your project in your tool of choice"
+        step=$((step + 1))
+        msg "${step}. Start prompting your AI assistant to interact with Databricks"
+        echo ""
+        msg "${D}Optional components: the ${B}MCP server${N}${D} and ${B}Visual Builder App${N}${D} are not${N}"
+        msg "${D}installed by default. If you want them, see the setup instructions in the${N}"
+        msg "${D}repo README: ${N}${B}https://github.com/databricks-solutions/ai-dev-kit${N}"
+        echo ""
+    fi
+}
+
+# Prompt for installation scope
+prompt_scope() {
+    if [ "$SILENT" = true ] || ! is_interactive; then
+        return
+    fi
+
+    # Verb defaults to install wording; uninstall passes "Uninstall"/"Remove" via
+    # SCOPE_PROMPT_TITLE / SCOPE_PROMPT_VERB so the same selector reads correctly.
+    local title="${SCOPE_PROMPT_TITLE:-Select installation scope}"
+    local verb="${SCOPE_PROMPT_VERB:-Install in}"
+
+    echo ""
+    echo -e "  ${B}Select installation scope${N}"
+
+    # Keep hints short — long ones wrap past the terminal width and break the
+    # cursor-up redraw in radio_select (each arrow press would stack a copy).
+    SCOPE=$(radio_select \
+        "Project|project|on|Current directory (.claude/, etc.)" \
+        "Global|global|off|Home directory (~/.claude/, etc.)" \
+    )
+}
+
+# Prompt to run auth
+prompt_auth() {
+    if [ "$SILENT" = true ] || ! is_interactive; then
+        return
+    fi
+
+    # Check if profile already has a token configured
+    local cfg_file="$HOME/.databrickscfg"
+    if [ -f "$cfg_file" ]; then
+        # Read the token value under the selected profile section
+        local in_profile=false
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^\[([a-zA-Z0-9_-]+)\]$ ]]; then
+                [ "${BASH_REMATCH[1]}" = "$PROFILE" ] && in_profile=true || in_profile=false
+            elif [ "$in_profile" = true ] && [[ "$line" =~ ^token[[:space:]]*= ]]; then
+                ok "Profile ${B}$PROFILE${N} already has a token configured — skipping auth"
+                return
+            fi
+        done < "$cfg_file"
+    fi
+
+    # Also skip if env vars are set
+    if [ -n "$DATABRICKS_TOKEN" ]; then
+        ok "DATABRICKS_TOKEN is set — skipping auth"
+        return
+    fi
+
+    # Databricks CLI is required for OAuth login
+    if ! command -v databricks >/dev/null 2>&1; then
+        warn "Databricks CLI not installed — cannot run OAuth login"
+        msg "  Install it, then run: ${B}${BL}databricks auth login --profile $PROFILE${N}"
+        return
+    fi
+
+    echo ""
+    msg "${B}Authentication${N}"
+    msg "This will run OAuth login for profile ${B}${BL}$PROFILE${N}"
+    msg "${D}A browser window will open for you to authenticate with your Databricks workspace.${N}"
+    echo ""
+    local run_auth
+    run_auth=$(prompt "Run ${B}databricks auth login --profile $PROFILE${N} now? ${D}(y/n)${N}" "y")
+    if [ "$run_auth" = "y" ] || [ "$run_auth" = "Y" ] || [ "$run_auth" = "yes" ]; then
+        echo ""
+        databricks auth login --profile "$PROFILE"
+    fi
+}
+
+# When a branch/tag is explicitly requested, hand off to THAT branch's own
+# installer so its real install steps run — this script only knows the current
+# version's steps. Prints the command and exits without installing.
+# DEVKIT_BOOTSTRAPPED (set in the printed command) suppresses the hand-off so
+# the target installer proceeds normally.
+handoff_to_branch() {
+    [ "$BRANCH_EXPLICIT" = true ] || return 0
+    [ -n "${DEVKIT_BOOTSTRAPPED:-}" ] && return 0
+    [ -f "${BASH_SOURCE[0]:-}" ] && return 0  # skip if local install file
+
+    local url="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}/install.sh"
+
+    # Silent/automated runs can't be handed off interactively — fail loudly
+    # (non-zero, message on stderr) so callers don't mistake it for success.
+    if [ "$SILENT" = true ]; then
+        die "Cannot install --branch ${BRANCH}: run that version's own installer (set DEVKIT_BOOTSTRAPPED=1 to bypass).
+   DEVKIT_BOOTSTRAPPED=1 bash <(curl -sL ${url}) -b ${BRANCH} --silent"
+    fi
+
+    echo ""
+    echo -e "${B}Install a specific version (${BRANCH})${N}"
+    echo "────────────────────────────────"
+    echo -e "  This script runs the ${B}current${N} version's install steps. To install"
+    echo -e "  ${B}${BRANCH}${N} using ${B}its own${N} installer, run:"
+    echo ""
+    echo -e "    ${G}DEVKIT_BOOTSTRAPPED=1 bash <(curl -sL ${url}) -b ${BRANCH}${N}"
+    echo ""
+    echo -e "  ${D}Append any options that version supports (add --help to see them).${N}"
+    echo -e "  ${D}Nothing was installed.${N}"
+    echo ""
+    exit 0
+}
+
+# ─── Pre-install check: an OLD install that predates the aitools flow ──────────
+# The current installer delegates skills to `databricks aitools`, which manages
+# them in a store (.databricks/aitools/skills/.state.json) and symlinks them into
+# each tool's skills dir. Older AI Dev Kit installs instead COPIED real skill
+# directories in place and/or installed the Claude Code plugin — neither is
+# managed by aitools, so reinstalling over them can leave stale/duplicate skills.
+# We detect that (for the scope we're installing into) and offer a full uninstall
+# first. Skills already managed by aitools — a CLI upgrade OR a prior run of THIS
+# installer — are deliberately NOT flagged: the aitools store is our evidence that
+# they did not come from the old flow.
+#
+# Sets PRIOR_INSTALL_KIND ("" when there's nothing to clean up) and _SUMMARY.
+detect_prior_install() {
+    PRIOR_INSTALL_KIND=""
+    PRIOR_INSTALL_SUMMARY=""
+    local base_dir aitools_state plugin_keys
+    [ "$SCOPE" = "global" ] && base_dir="$HOME" || base_dir="$(pwd)"
+    aitools_state="$base_dir/.databricks/aitools/skills/.state.json"
+
+    local -a roots
+    if [ "$SCOPE" = "global" ]; then
+        roots=(
+            "$HOME/.claude/skills" "$HOME/.cursor/skills" "$HOME/.github/skills"
+            "$HOME/.agents/skills" "$HOME/.gemini/skills" "$HOME/.gemini/antigravity/skills"
+            "$HOME/.codeium/windsurf/skills" "$HOME/.config/opencode/skills" "$HOME/.kiro/skills"
+        )
+    else
+        roots=(
+            "$base_dir/.claude/skills" "$base_dir/.cursor/skills" "$base_dir/.github/skills"
+            "$base_dir/.agents/skills" "$base_dir/.gemini/skills" "$base_dir/.windsurf/skills"
+            "$base_dir/.opencode/skills" "$base_dir/.kiro/skills"
+        )
+    fi
+
+    # Count real (non-symlink) skill dirs under known names. aitools SYMLINKS its
+    # skills, so a real directory is evidence of an old direct copy. When an aitools
+    # store exists for the scope, the skills are CLI-managed (upgrade path) and are
+    # NOT flagged — this is the "installed via the current flow" evidence.
+    local legacy=0 root name p
+    if [ ! -f "$aitools_state" ]; then
+        for root in "${roots[@]}"; do
+            [ -d "$root" ] || continue
+            for name in $UNINSTALL_SKILL_NAMES; do
+                p="$root/$name"
+                [ -d "$p" ] && [ ! -L "$p" ] && legacy=$((legacy + 1))
+            done
+        done
+    fi
+
+    if [ "$SCOPE" = "global" ]; then plugin_keys="$(plugin_keys_global)"; else plugin_keys="$(plugin_keys_project "$base_dir")"; fi
+
+    local -a kinds=()
+    if [ -n "$plugin_keys" ]; then
+        kinds+=("plugin")
+        PRIOR_INSTALL_SUMMARY="${PRIOR_INSTALL_SUMMARY}  - Claude Code plugin: $(printf '%s' "$plugin_keys" | tr '\n' ' ')\n"
+    fi
+    if [ "$legacy" -gt 0 ]; then
+        kinds+=("legacy-skills")
+        PRIOR_INSTALL_SUMMARY="${PRIOR_INSTALL_SUMMARY}  - ${legacy} directly-installed skill folder(s) (not managed by databricks aitools)\n"
+    fi
+    PRIOR_INSTALL_KIND="$(IFS=+; echo "${kinds[*]}")"
+    return 0
+}
+
+# If an old-style install is detected for the target scope, recommend a full
+# uninstall and (interactively) offer to run it before installing.
+check_prior_install() {
+    detect_prior_install
+    [ -z "$PRIOR_INSTALL_KIND" ] && return 0
+
+    local scope_flag=""
+    [ "$SCOPE" = "global" ] && scope_flag=" --global"
+
+    leftovers_box "⚠  PREVIOUS AI DEV KIT INSTALL DETECTED (${SCOPE} scope)" \
+        "This looks like an older install (skills copied directly and/or the Claude Code plugin) that predates the current ${B}databricks aitools${N}${Y} flow. Reinstalling over it can leave stale or duplicate skills." \
+        "$(printf '%b' "$PRIOR_INSTALL_SUMMARY")" \
+        "Recommended: remove it first with  install.sh --uninstall${scope_flag}"
+
+    # Non-interactive / silent: never auto-remove; warn and continue.
+    if [ "$SILENT" = true ] || ! is_interactive; then
+        warn "Skipping cleanup (non-interactive). Re-run with ${B}--uninstall${scope_flag}${N} to remove the old install."
+        return 0
+    fi
+
+    local ans
+    ans=$(prompt "Remove the previous install now (recommended) before continuing? [Y/n]" "Y")
+    case "$ans" in
+        [Nn]*)
+            warn "Leaving the previous install in place — some skills may be stale or duplicated."
+            ;;
+        *)
+            # Full uninstall for THIS scope, no extra scope/confirm prompt. Runs in a
+            # subshell because run_uninstall exits on completion; the subshell absorbs
+            # that exit so the install continues on a freshly cleaned slate.
+            ( SCOPE_EXPLICIT=true; ASSUME_YES=true; run_uninstall ) \
+                || warn "Cleanup reported an issue — continuing with the install."
+            ok "Previous install removed — continuing with a fresh install."
+            ;;
+    esac
+    return 0
+}
+
+# Main
+main() {
+    # An explicit --branch hands off to that version's own installer
+    handoff_to_branch
+
+    # --list-skills exits early (uses the live aitools inventory when available)
+    [ "${LIST_SKILLS:-false}" = true ] && list_skills_and_exit
+
+    if [ "$SILENT" = false ]; then
+        echo ""
+        echo -e "${B}Databricks AI Dev Kit Installer${N}"
+        echo "────────────────────────────────"
+    fi
+
+    # Check dependencies
+    step "Checking prerequisites"
+    check_deps
+
+    # Discover the agent-skills inventory (live via `databricks aitools list`, or fallback)
+    fetch_agent_b_inventory
+
+    # ── Step 2: Interactive tool selection ──
+    step "Selecting tools"
+    detect_tools
+    ok "Selected: $(echo "$TOOLS" | tr ' ' ', ')"
+
+    # ── Step 3: Interactive profile selection ──
+    step "Databricks profile"
+    prompt_profile
+    ok "Profile: $PROFILE"
+
+    # ── Step 3.5: Interactive scope selection ──
+    if [ "$SCOPE_EXPLICIT" = false ]; then
+        prompt_scope
+        ok "Scope: $SCOPE"
+    fi
+
+    # Set state directory based on scope (for profile/manifest storage)
+    if [ "$SCOPE" = "global" ]; then
+        STATE_DIR="$INSTALL_DIR"
+    else
+        STATE_DIR="$(pwd)/.ai-dev-kit"
+    fi
+
+    # Offer to remove an older, non-aitools install for this scope before we install
+    check_prior_install
+
+    # ── Step 4: Skill profile selection ──
+    if [ "$INSTALL_SKILLS" = true ]; then
+        step "Skill profiles"
+        prompt_skills_profile
+        resolve_skills
+        resolve_fetch_refs
+        # Count for display
+        local sk_count
+        sk_count=$(_count $SELECTED_MLFLOW_SKILLS $SELECTED_AGENT_B_SKILLS)
+        if [ -n "$USER_SKILLS" ]; then
+            ok "Custom selection ($sk_count skills)"
+        else
+            ok "Profile: ${SKILLS_PROFILE:-all} ($sk_count skills)"
+        fi
+    fi
+
+    # ── Step 5: Confirm before proceeding ──
+    if [ "$SILENT" = false ]; then
+        echo ""
+        echo -e "  ${B}Summary${N}"
+        echo -e "  ────────────────────────────────────"
+        echo -e "  Tools:       ${G}$(echo "$TOOLS" | tr ' ' ', ')${N}"
+        echo -e "  Profile:     ${G}${PROFILE}${N}"
+        echo -e "  Scope:       ${G}${SCOPE}${N}"
+        if [ "$INSTALL_SKILLS" = true ]; then
+            if [ -n "$USER_SKILLS" ]; then
+                echo -e "  Skills:      ${G}custom selection${N} ${Y}(will be overwritten, backup your changes first)${N}"
+            else
+                local sk_total
+                sk_total=$(_count $SELECTED_MLFLOW_SKILLS $SELECTED_AGENT_B_SKILLS)
+                echo -e "  Skills:      ${G}${SKILLS_PROFILE:-all} ($sk_total skills)${N} ${Y}(will be overwritten, backup your changes first)${N}"
+            fi
+            [ -n "$SELECTED_AGENT_B_SKILLS" ] && echo -e "  Agent skills: ${G}via databricks aitools${N} ${D}(requires Databricks CLI v${MIN_AITOOLS_CLI_VERSION}+)${N}"
+            [ "$INSTALL_EXPERIMENTAL" = false ] && echo -e "  Experimental: ${Y}excluded${N} ${D}(--experimental false)${N}"
+        fi
+        echo ""
+    fi
+
+    # ── Dry run: report the plan and exit before any changes ──
+    if [ "$DRY_RUN" = true ]; then
+        dry_run_report
+        exit 0
+    fi
+
+    if [ "$SILENT" = false ] && is_interactive; then
+        local confirm
+        confirm=$(prompt "Proceed with installation? ${D}(y/n)${N}" "y")
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ] && [ "$confirm" != "yes" ]; then
+            echo ""
+            msg "Installation cancelled."
+            exit 0
+        fi
+    fi
+
+    # ── Step 6: Version check (may exit early if up to date) ──
+    check_version
+
+    # Determine base directory
+    local base_dir
+    [ "$SCOPE" = "global" ] && base_dir="$HOME" || base_dir="$(pwd)"
+
+    # Install skills managed by this installer (MLflow)
+    [ "$INSTALL_SKILLS" = true ] && install_skills "$base_dir"
+
+    # Install agent skills (delegated to `databricks aitools`)
+    [ "$INSTALL_SKILLS" = true ] && install_agent_b_skills "$base_dir"
+
+    # Record resolved sources
+    [ "$INSTALL_SKILLS" = true ] && write_lockfile
+
+    # Write GEMINI.md if gemini is selected
+    if echo "$TOOLS" | grep -q gemini; then
+        if [ "$SCOPE" = "global" ]; then
+            write_gemini_md "$HOME/GEMINI.md"
+        else
+            write_gemini_md "$base_dir/GEMINI.md"
+        fi
+    fi
+
+    # Save version
+    save_version
+    
+    # Prompt to run auth
+    prompt_auth
+    
+    # Done
+    summary
+}
+
+# Uninstall short-circuits before install runs. Placed here (after all helpers,
+# e.g. prompt_scope / is_interactive, are defined) so run_uninstall can reuse them.
+if [ "$UNINSTALL" = true ]; then
+    run_uninstall
+fi
+
+main "$@"

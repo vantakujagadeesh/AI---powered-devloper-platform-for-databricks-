@@ -1,0 +1,10 @@
+# AI Dev Kit Integration Dependencies
+# Install from local databricks-builder-app (vendored tool packages)
+
+-e ../..  # databricks-builder-app (includes packages/databricks_tools_core + databricks_agent_tools)
+
+# Claude Agent SDK
+claude-agent-sdk>=0.1.0
+
+# For loading environment variables
+python-dotenv>=1.0.0
